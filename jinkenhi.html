@@ -16,6 +16,18 @@
 <body>
 <div id="root"></div>
 <script type="text/babel">
+// ── localStorage ラッパー（window.storage互換） ──────────
+function localStorageGet(key) {
+  try { const v = localStorage.getItem(key); return v !== null ? { value: v } : null; } catch(e) { return null; }
+}
+function localStorageSet(key, value) {
+  try { localStorage.setItem(key, value); } catch(e) {}
+}
+function localStorageDel(key) {
+  try { localStorage.removeItem(key); } catch(e) {}
+}
+// ─────────────────────────────────────────────────────────
+
 const { useState, useMemo, useEffect, useCallback } = React;
 
 
@@ -476,17 +488,17 @@ function App() {
     (async () => {
       try {
         // 期一覧を読み込み
-        const pr = await window.storage.get(SK_PERIODS);
+        const pr = localStorageGet(SK_PERIODS);
         const savedPeriods = pr ? JSON.parse(pr.value) : null;
         if (savedPeriods) setPeriods(savedPeriods);
 
         // 選択中の期を読み込み
-        const cr = await window.storage.get(SK_CURRENT);
+        const cr = localStorageGet(SK_CURRENT);
         const pid = cr ? Number(cr.value) : 21;
         setCurrentPid(pid);
 
         // 選択中の期のスタッフを読み込み
-        const sr = await window.storage.get(SK_STAFF(pid));
+        const sr = localStorageGet(SK_STAFF(pid));
         if (sr) setStaff(JSON.parse(sr.value));
 
         // 全期の年間合計をロード（推移グラフ用）
@@ -495,8 +507,8 @@ function App() {
         const hist = { 20: PERIOD_20_DATA }; // 第20期は常に固定値
         for (const p of allPeriods) {
           if (p.id === 20) continue; // 第20期は固定値を使うのでスキップ
-          const d  = await window.storage.get(SK_STAFF(p.id));
-          const dh = await window.storage.get(SK_HANKANHI(p.id));
+          const d  = localStorageGet(SK_STAFF(p.id));
+          const dh = localStorageGet(SK_HANKANHI(p.id));
           const jinkenhi = d  ? JSON.parse(d.value).reduce((s,x)=>s+calcAnnualTotal(x),0) : 0;
           const hItems   = dh ? JSON.parse(dh.value) : [];
           const hankanhi = Object.values(HANKANHI_BASE_20).reduce((a,b)=>a+b,0)
@@ -518,7 +530,7 @@ function App() {
         setHistoryData(hist);
 
         // グレードマスタを読み込み
-        const gm = await window.storage.get(SK_GRADEMASTER(pid));
+        const gm = localStorageGet(SK_GRADEMASTER(pid));
         if (gm) setGradeMaster(JSON.parse(gm.value));
       } catch(e) { /* 初回起動 */ }
       setStorageReady(true);
@@ -535,17 +547,17 @@ function App() {
     if (pid === currentPid) return;
     isSwitching.current = true;
     // 現在のスタッフを先に保存
-    try { await window.storage.set(SK_STAFF(currentPid), JSON.stringify(staff)); } catch(e) {}
+    try { localStorageSet(SK_STAFF(currentPid), JSON.stringify(staff)); } catch(e) {}
     // 新しい期のスタッフをストレージから読み込み
     let newStaff = pid === 21 ? INIT_STAFF.map(s=>({...s})) : [];
     try {
-      const sr = await window.storage.get(SK_STAFF(pid));
+      const sr = localStorageGet(SK_STAFF(pid));
       if (sr) newStaff = JSON.parse(sr.value);
     } catch(e) {}
     // 販管費も切り替え
     let newHankanhi = [];
     try {
-      const hr = await window.storage.get(SK_HANKANHI(pid));
+      const hr = localStorageGet(SK_HANKANHI(pid));
       if (hr) newHankanhi = JSON.parse(hr.value);
     } catch(e) {}
     // 一括更新（React batched update）
@@ -554,14 +566,14 @@ function App() {
     setHankanhiItems(newHankanhi);
     setBearAdj({skillAdd:0,careerAdd:0,overrides:{}});
     setShowBear(false);
-    try { await window.storage.set(SK_CURRENT, String(pid)); } catch(e) {}
+    try { localStorageSet(SK_CURRENT, String(pid)); } catch(e) {}
     const label = periods.find(p=>p.id===pid)?.label ?? `第${pid}期`;
     setNotif({msg:`${label}に切り替えました`,type:"ok"});
     setTimeout(()=>setNotif(null),3000);
     // グレードマスタも切り替え
     let newGM = GRADE_MASTER.map(g=>({...g}));
     try {
-      const gmr = await window.storage.get(SK_GRADEMASTER(pid));
+      const gmr = localStorageGet(SK_GRADEMASTER(pid));
       if (gmr) newGM = JSON.parse(gmr.value);
     } catch(e) {}
     setGradeMaster(newGM);
@@ -573,15 +585,15 @@ function App() {
   const addPeriod = useCallback(async (newPeriod) => {
     const updated = [...periods, newPeriod];
     setPeriods(updated);
-    await window.storage.set(SK_PERIODS, JSON.stringify(updated));
+    localStorageSet(SK_PERIODS, JSON.stringify(updated));
     // 前の期のグレードマスタをコピー
-    await window.storage.set(SK_GRADEMASTER(newPeriod.id), JSON.stringify(gradeMaster));
+    localStorageSet(SK_GRADEMASTER(newPeriod.id), JSON.stringify(gradeMaster));
     // 前の期のスタッフをコピーして新しい期の初期データに
     const copiedStaff = staff.map(s=>({...s, age: s.age+1,
       incomeTaxOverride:null, residentTaxOverride:null,
       insOverride:null, bonus9InsOverride:null, bonus3InsOverride:null
     }));
-    await window.storage.set(SK_STAFF(newPeriod.id), JSON.stringify(copiedStaff));
+    localStorageSet(SK_STAFF(newPeriod.id), JSON.stringify(copiedStaff));
     switchPeriod(newPeriod.id);
     showNotif(`${newPeriod.label}を追加しました`);
   }, [periods, staff, switchPeriod]);
@@ -600,7 +612,7 @@ function App() {
     if (!storageReady) return;
     (async () => {
       try {
-        const hr = await window.storage.get(SK_HANKANHI(currentPid));
+        const hr = localStorageGet(SK_HANKANHI(currentPid));
         if (hr) setHankanhiItems(JSON.parse(hr.value));
         else setHankanhiItems([]);
       } catch(e) { setHankanhiItems([]); }
@@ -614,7 +626,7 @@ function App() {
     const pid = currentPidRef.current;
     (async () => {
       try {
-        await window.storage.set(SK_HANKANHI(pid), JSON.stringify(hankanhiItems));
+        localStorageSet(SK_HANKANHI(pid), JSON.stringify(hankanhiItems));
       } catch(e) {}
     })();
   }, [hankanhiItems, storageReady]);
@@ -627,7 +639,7 @@ function App() {
     if (isSwitching.current) return;
     (async () => {
       try {
-        await window.storage.set(SK_GRADEMASTER(currentPid), JSON.stringify(gradeMaster));
+        localStorageSet(SK_GRADEMASTER(currentPid), JSON.stringify(gradeMaster));
       } catch(e) {}
     })();
   }, [gradeMaster, storageReady, currentPid]);
@@ -674,7 +686,7 @@ function App() {
     const pid = currentPidRef.current;
     (async () => {
       try {
-        await window.storage.set(SK_STAFF(pid), JSON.stringify(staff));
+        localStorageSet(SK_STAFF(pid), JSON.stringify(staff));
       } catch(e) {}
       const jinkenhi = staff.reduce((s,x)=>s+calcAnnualTotal(x),0);
       const hankanhi = MONTHS.reduce((s,m)=>s+calcHankanhiMonth(m),0);
@@ -766,9 +778,9 @@ function App() {
     const gradeMasterByPeriod = {};
     for (const p of periods) {
       try {
-        const hr = await window.storage.get(SK_HANKANHI(p.id));
+        const hr = localStorageGet(SK_HANKANHI(p.id));
         if (hr) hankanhiByPeriod[p.id] = JSON.parse(hr.value);
-        const gr = await window.storage.get(SK_GRADEMASTER(p.id));
+        const gr = localStorageGet(SK_GRADEMASTER(p.id));
         if (gr) gradeMasterByPeriod[p.id] = JSON.parse(gr.value);
       } catch(e) {}
     }
@@ -777,7 +789,7 @@ function App() {
     for (const p of periods) {
       if (p.id === currentPid) continue;
       try {
-        const sr = await window.storage.get(SK_STAFF(p.id));
+        const sr = localStorageGet(SK_STAFF(p.id));
         if (sr) staffByPeriodAll[p.id] = JSON.parse(sr.value);
       } catch(e) {}
     }
@@ -812,21 +824,21 @@ function App() {
         if (!merged.find(x=>x.id===p.id)) merged.push(p);
       }
       setPeriods(merged);
-      await window.storage.set(SK_PERIODS, JSON.stringify(merged));
+      localStorageSet(SK_PERIODS, JSON.stringify(merged));
       // スタッフ復元（全期）
       for (const [pid, st] of Object.entries(payload.staffByPeriod)) {
-        await window.storage.set(SK_STAFF(Number(pid)), JSON.stringify(st));
+        localStorageSet(SK_STAFF(Number(pid)), JSON.stringify(st));
       }
       // 販管費復元
       if (payload.hankanhiByPeriod) {
         for (const [pid, items] of Object.entries(payload.hankanhiByPeriod)) {
-          await window.storage.set(SK_HANKANHI(Number(pid)), JSON.stringify(items));
+          localStorageSet(SK_HANKANHI(Number(pid)), JSON.stringify(items));
         }
       }
       // グレードマスタ復元
       if (payload.gradeMasterByPeriod) {
         for (const [pid, gm] of Object.entries(payload.gradeMasterByPeriod)) {
-          await window.storage.set(SK_GRADEMASTER(Number(pid)), JSON.stringify(gm));
+          localStorageSet(SK_GRADEMASTER(Number(pid)), JSON.stringify(gm));
         }
       }
       const targetPid = payload.currentPeriod ?? currentPid;
@@ -834,7 +846,7 @@ function App() {
       if (targetStaff) {
         setStaff(targetStaff);
         setCurrentPid(targetPid);
-        await window.storage.set(SK_CURRENT, String(targetPid));
+        localStorageSet(SK_CURRENT, String(targetPid));
       }
       // 現在の期の販管費をstateに反映
       if (payload.hankanhiByPeriod?.[targetPid]) {
@@ -861,21 +873,21 @@ function App() {
           if (!merged.find(x=>x.id===p.id)) merged.push(p);
         }
         setPeriods(merged);
-        await window.storage.set(SK_PERIODS, JSON.stringify(merged));
+        localStorageSet(SK_PERIODS, JSON.stringify(merged));
         // スタッフデータを復元（全期）
         for (const [pid, st] of Object.entries(payload.staffByPeriod)) {
-          await window.storage.set(SK_STAFF(Number(pid)), JSON.stringify(st));
+          localStorageSet(SK_STAFF(Number(pid)), JSON.stringify(st));
         }
         // 販管費を復元（全期）
         if (payload.hankanhiByPeriod) {
           for (const [pid, items] of Object.entries(payload.hankanhiByPeriod)) {
-            await window.storage.set(SK_HANKANHI(Number(pid)), JSON.stringify(items));
+            localStorageSet(SK_HANKANHI(Number(pid)), JSON.stringify(items));
           }
         }
         // グレードマスタを復元（全期）
         if (payload.gradeMasterByPeriod) {
           for (const [pid, gm] of Object.entries(payload.gradeMasterByPeriod)) {
-            await window.storage.set(SK_GRADEMASTER(Number(pid)), JSON.stringify(gm));
+            localStorageSet(SK_GRADEMASTER(Number(pid)), JSON.stringify(gm));
           }
         }
         // 現在の期のスタッフ・販管費をstateに反映
@@ -884,7 +896,7 @@ function App() {
         if (targetStaff) {
           setStaff(targetStaff);
           setCurrentPid(targetPid);
-          await window.storage.set(SK_CURRENT, String(targetPid));
+          localStorageSet(SK_CURRENT, String(targetPid));
         }
         if (payload.hankanhiByPeriod?.[targetPid]) {
           setHankanhiItems(payload.hankanhiByPeriod[targetPid]);
