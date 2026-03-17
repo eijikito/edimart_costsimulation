@@ -1,0 +1,3192 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>人件費シミュレーター</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #f0f2f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useEffect, useCallback } = React;
+
+
+// ══════════════════════════════════════════════
+//  定数
+// ══════════════════════════════════════════════
+const MONTHS = ["4月","5月","6月","7月","8月","9月","10月","11月","12月","1月","2月","3月"];
+const BONUS_MONTHS = ["9月","3月"];
+
+const EMP_TYPES = {
+  EXEC:     { label: "役員",       color: "#7c6af7" },
+  FULL:     { label: "正社員",     color: "#2563eb" },
+  CONTRACT: { label: "契約社員",   color: "#059669" },
+  PART:     { label: "アルバイト", color: "#d97706" },
+};
+
+// ── キャリアフローに基づくグレードマスタ ──────────────────
+// スキル給は職位×クラスで一律固定
+const GRADE_MASTER = [
+  { key:"EN",    label:"EN",     skillSalary: 0,      desc:"エントリー" },
+  { key:"AS-1",  label:"AS Ⅰ",  skillSalary: 120000, desc:"アソシエイト Ⅰ" },
+  { key:"AS-2",  label:"AS Ⅱ",  skillSalary: 130000, desc:"アソシエイト Ⅱ" },
+  { key:"PR-1",  label:"PR Ⅰ",  skillSalary: 150000, desc:"プロフェッショナル Ⅰ" },
+  { key:"PR-2",  label:"PR Ⅱ",  skillSalary: 160000, desc:"プロフェッショナル Ⅱ" },
+  { key:"PR-3",  label:"PR Ⅲ",  skillSalary: 170000, desc:"プロフェッショナル Ⅲ" },
+  { key:"EX-1",  label:"EX Ⅰ",  skillSalary: 190000, desc:"エキスパート Ⅰ" },
+  { key:"EX-2",  label:"EX Ⅱ",  skillSalary: 200000, desc:"エキスパート Ⅱ" },
+  { key:"EX-3",  label:"EX Ⅲ",  skillSalary: 210000, desc:"エキスパート Ⅲ" },
+  { key:"MS-1",  label:"MS Ⅰ",  skillSalary: 240000, desc:"マスター Ⅰ" },
+  { key:"MS-2",  label:"MS Ⅱ",  skillSalary: 260000, desc:"マスター Ⅱ" },
+  { key:"EXEC",  label:"役員",   skillSalary: 0,      desc:"役員（スキル給なし）" },
+];
+const gradeByKey = Object.fromEntries(GRADE_MASTER.map(g=>[g.key,g]));
+
+const POSITION_ALLOWANCES = [
+  { label:"なし",         amount:0 },
+  { label:"サブマネ",     amount:10000 },
+  { label:"マネージャー", amount:30000 },
+  { label:"ディビジョン", amount:40000 },
+];
+
+const INS_RATE = { health:0.04965, pension:0.0915, employ:0.0095 }; // 愛知県協会けんぽ2026年度
+const KOSODATE_RATE = 0.00115; // 子ども・子育て支援金（会社負担のみ・5月分から）
+const KOSODATE_MONTHS = ["5月","6月","7月","8月","9月","10月","11月","12月","1月","2月","3月"];
+const HYOJUN_TABLE = [
+  [63000,58000],[73000,68000],[83000,78000],[93000,88000],[101000,98000],
+  [107000,104000],[114000,110000],[122000,118000],[130000,126000],[138000,134000],
+  [146000,142000],[155000,150000],[165000,160000],[175000,170000],[185000,180000],
+  [195000,190000],[210000,200000],[230000,220000],[250000,240000],[270000,260000],
+  [290000,280000],[310000,300000],[330000,320000],[350000,340000],[370000,360000],
+  [395000,380000],[425000,410000],[455000,440000],[485000,470000],[515000,500000],
+  [545000,530000],[575000,560000],[605000,590000],[635000,620000],[665000,650000],
+  [695000,680000],[730000,710000],[999999999,750000],
+];
+const getHyojun = (m) => { for (const [u,s] of HYOJUN_TABLE) if (m<=u) return s; return 750000; };
+const calcSocialIns = (g) => Math.round(getHyojun(g)*(INS_RATE.health+INS_RATE.pension+INS_RATE.employ));
+const calcBonusIns  = (b) => Math.round(Math.min(b,1500000)*(INS_RATE.health+INS_RATE.pension+INS_RATE.employ));
+
+const WORK_HOURS_MONTH   = 162;
+const SANROKYO_LIMIT_MONTH = 45;
+const LEGAL_HOURS_MONTH  = 173;
+const OVER_60H_THRESHOLD = 60;
+
+const calcMonthlyOTHours = (rate) => {
+  if (!rate) return 0;
+  return Math.min(45 * rate / 100, 30);
+};
+
+const calcOvertimeDetail = (base, hours) => {
+  if (hours<=0||base<=0) return {total:0,breakdown:[]};
+  const hr = base/WORK_HOURS_MONTH;
+  const legalInner = LEGAL_HOURS_MONTH - WORK_HOURS_MONTH; // 11h
+  const h1 = Math.min(hours, legalInner);
+  const pay1 = Math.round(hr*1.00*h1);
+  const h2raw = Math.max(hours-legalInner,0);
+  const h2cap = Math.max(OVER_60H_THRESHOLD-legalInner,0); // 49h
+  const h2 = Math.min(h2raw,h2cap);
+  const pay2 = Math.round(hr*1.25*h2);
+  const h3 = Math.max(h2raw-h2cap,0);
+  const pay3 = Math.round(hr*1.50*h3);
+  const breakdown=[];
+  if(h1>0) breakdown.push({label:"所定外・法定内",hours:h1,rate:1.00,pay:pay1});
+  if(h2>0) breakdown.push({label:"法定時間外",   hours:h2,rate:1.25,pay:pay2});
+  if(h3>0) breakdown.push({label:"60時間超割増", hours:h3,rate:1.50,pay:pay3});
+  return {total:pay1+pay2+pay3,breakdown};
+};
+
+// ── ベア適用後の給与を計算 ──────────────────────────────
+// bearAdj: { skillAdd: number, careerAdd: number, overrides: {[id]: {skillAdd?, careerAdd?}} }
+const applyBear = (s, bearAdj) => {
+  if (s.empType==="PART") return s;
+  const ov = bearAdj.overrides?.[s.id] ?? {};
+  if (s.empType==="EXEC") {
+    const execAdd = ov.execAdd || 0;
+    return { ...s, monthlyBase: s.monthlyBase + execAdd };
+  }
+  const skillAdd  = ov.skillAdd  !== undefined ? ov.skillAdd  : (bearAdj.skillAdd  || 0);
+  const careerAdd = ov.careerAdd !== undefined ? ov.careerAdd : (bearAdj.careerAdd || 0);
+  const newSkill  = (s.skillSalary  || 0) + skillAdd;
+  const newCareer = (s.careerSalary || 0) + careerAdd;
+  return { ...s, skillSalary:newSkill, careerSalary:newCareer, monthlyBase:newSkill+newCareer };
+};
+
+
+
+// ══════════════════════════════════════════════
+//  販管費定数
+// ══════════════════════════════════════════════
+// 第20期月別実績（販管費のみ）
+const HANKANHI_BASE_20 = {
+  "4月":2131272,"5月":1308938,"6月":1534596,"7月":2000348,
+  "8月":999948,"9月":1962688,"10月":1408527,"11月":1202902,
+  "12月":1405449,"1月":1907660,"2月":1387628,"3月":2460839
+};
+
+// 増減項目のストレージキー
+const SK_HANKANHI   = (pid) => `hankanhi:${pid}`;
+// グレードマスタのストレージキー
+const SK_GRADEMASTER = (pid) => `grademaster:${pid}`;
+
+// 空の増減項目テンプレート
+const emptyHankanhi = () => ({
+  id: Date.now(),
+  name: "",
+  category: "",
+  amount: 0,           // 正=増加、負=減少
+  applyType: "monthly", // "monthly"=毎月固定 | "specific"=特定月のみ | "custom"=月別入力
+  startMonth: "4月",   // applyType=monthlyの開始月
+  endMonth: "3月",     // applyType=monthlyの終了月
+  specificMonths: [],  // applyType=specificの対象月リスト
+  monthlyAmounts: {},  // applyType=customの月別金額 {月: 金額}
+  note: "",
+});
+
+// ══════════════════════════════════════════════
+//  期マスタ
+// ══════════════════════════════════════════════
+const PERIOD_20 = { id: 20, label: "第20期", year: "2025年度", startYear: 2024 };
+const PERIOD_21 = { id: 21, label: "第21期", year: "2026年度", startYear: 2025 };
+const INIT_PERIODS = [PERIOD_20, PERIOD_21];
+
+// 第20期の実績データ（historyDataに初期値として使用）
+const PERIOD_20_DATA = {
+  jinkenhi: 74126849,
+  hankanhi: 19710795,
+  total:    93837644,
+};
+
+// ストレージキー
+const SK_PERIODS  = "periods";        // 期一覧
+const SK_CURRENT  = "currentPeriod";  // 選択中の期ID
+const SK_STAFF    = (pid) => `staff:${pid}`;  // 期別スタッフ
+
+// ══════════════════════════════════════════════
+//  初期スタッフデータ（キャリアフロー反映）
+// ══════════════════════════════════════════════
+const INIT_STAFF = [
+  { id:1,  name:"鬼頭",  empType:"EXEC",     gradeKey:"EXEC",  age:52, monthlyBase:1050000, skillSalary:0,      careerSalary:0,     hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:0, overtimeRate:0,  commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:false, bonus3Enable:false, bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"代表取締役" },
+  { id:2,  name:"堀田",  empType:"EXEC",     gradeKey:"EXEC",  age:36, monthlyBase:630000,  skillSalary:0,      careerSalary:0,     hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:0, overtimeRate:0,  commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:false, bonus3Enable:false, bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"役員" },
+  { id:3,  name:"須崎",  empType:"EXEC",     gradeKey:"EXEC",  age:43, monthlyBase:567000,  skillSalary:0,      careerSalary:0,     hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:0, overtimeRate:0,  commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:false, bonus3Enable:false, bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"役員" },
+  { id:4,  name:"鹿島",  empType:"FULL",     gradeKey:"MS-1",  age:53, monthlyBase:284000,  skillSalary:240000, careerSalary:44000, hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:2, overtimeRate:70, commAllowance:0, housingAllowance:16000, insOverride:null, bonus9Enable:true,  bonus3Enable:true,  bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"" },
+  { id:5,  name:"恒川",  empType:"FULL",     gradeKey:"EX-3",  age:29, monthlyBase:276000,  skillSalary:210000, careerSalary:66000, hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:1, overtimeRate:100, commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:true,  bonus3Enable:true,  bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"1UP" },
+  { id:6,  name:"森永",  empType:"FULL",     gradeKey:"PR-3",  age:28, monthlyBase:231600,  skillSalary:170000, careerSalary:61600, hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:0, overtimeRate:100, commAllowance:0, housingAllowance:15000, insOverride:null, bonus9Enable:true,  bonus3Enable:true,  bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"1UP" },
+  { id:7,  name:"松永",  empType:"FULL",     gradeKey:"PR-2",  age:37, monthlyBase:228200,  skillSalary:160000, careerSalary:68200, hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:0, overtimeRate:100, commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:true,  bonus3Enable:false, bonus9Months:1, bonus3Months:0, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"4月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"産休予定" },
+  { id:8,  name:"木村",  empType:"FULL",     gradeKey:"PR-2",  age:30, monthlyBase:236450,  skillSalary:160000, careerSalary:76450, hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:0, overtimeRate:60, commAllowance:0, housingAllowance:16000, insOverride:null, bonus9Enable:true,  bonus3Enable:true,  bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"" },
+  { id:9,  name:"城野",  empType:"FULL",     gradeKey:"PR-2",  age:27, monthlyBase:223800,  skillSalary:160000, careerSalary:63800, hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:0, overtimeRate:100, commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:true,  bonus3Enable:true,  bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"1UP" },
+  { id:10, name:"佐藤",  empType:"CONTRACT", gradeKey:"AS-2",  age:51, monthlyBase:176500,  skillSalary:160000, careerSalary:16500, hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:0, overtimeRate:70,  commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:true,  bonus3Enable:true,  bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"時短75%" },
+  { id:11, name:"葉柴",  empType:"PART",     gradeKey:"EN",    age:28, monthlyBase:0,       skillSalary:0,      careerSalary:0,     hourlyWage:1350, monthlyHours:140, posAllowanceIdx:0, overtimeRate:0,  commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:false, bonus3Enable:false, bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"時給1350円" },
+  { id:12, name:"今井",  empType:"CONTRACT", gradeKey:"AS-2",  age:26, monthlyBase:197000,  skillSalary:130000, careerSalary:67000, hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:0, overtimeRate:100, commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:true,  bonus3Enable:true,  bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"1UP" },
+  { id:13, name:"原田",  empType:"PART",     gradeKey:"EN",    age:26, monthlyBase:0,       skillSalary:0,      careerSalary:0,     hourlyWage:1300, monthlyHours:140, posAllowanceIdx:0, overtimeRate:0,  commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:false, bonus3Enable:false, bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"" },
+  { id:14, name:"吉田",  empType:"CONTRACT", gradeKey:"AS-1",  age:24, monthlyBase:187000,  skillSalary:120000, careerSalary:64000, hourlyWage:0,    monthlyHours:0,   posAllowanceIdx:0, overtimeRate:100, commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:true,  bonus3Enable:true,  bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"" },
+  { id:15, name:"新アルバイト", empType:"PART", gradeKey:"EN", age:18, monthlyBase:0,       skillSalary:0,      careerSalary:0,     hourlyWage:1300, monthlyHours:140, posAllowanceIdx:0, overtimeRate:0,  commAllowance:0, housingAllowance:0,  insOverride:null, bonus9Enable:false, bonus3Enable:false, bonus9Months:6, bonus3Months:6, bonus9Amount:null, bonus3Amount:null, workStartMonth:"10月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:"10月から" },
+];
+
+// ══════════════════════════════════════════════
+//  計算ロジック
+// ══════════════════════════════════════════════
+const MONTH_IDX = Object.fromEntries(MONTHS.map((m,i)=>[m,i]));
+const isWorking = (s, month) => {
+  const mi = MONTH_IDX[month];
+  const si = MONTH_IDX[s.workStartMonth ?? "4月"];
+  const ei = MONTH_IDX[s.workEndMonth   ?? "3月"];
+  if (si <= ei) return mi >= si && mi <= ei;
+  return mi >= si || mi <= ei;
+};
+
+const calcMonthlyGross = (s, month) => {
+  if (!isWorking(s,month)) return 0;
+  let base = s.empType==="PART" ? s.hourlyWage*s.monthlyHours : s.monthlyBase;
+  let overtime=0, posAll=0, extras=0;
+  if (s.empType==="FULL"||s.empType==="CONTRACT") {
+    // 手動上書きがあれば優先、なければ自動計算
+    if (s.overtimeAmountOverride!=null && s.overtimeAmountOverride!=="") {
+      overtime = Number(s.overtimeAmountOverride);
+    } else if (s.overtimeRate>0) {
+      overtime = calcOvertimeDetail(s.monthlyBase,calcMonthlyOTHours(s.overtimeRate)).total;
+    }
+    posAll = POSITION_ALLOWANCES[s.posAllowanceIdx]?.amount??0;
+    extras = (s.commAllowance||0)+(s.housingAllowance||0);
+  }
+  return base+overtime+posAll+extras;
+};
+const calcBonus = (s,month) => {
+  const en = month==="9月" ? s.bonus9Enable : s.bonus3Enable;
+  if (!en) return 0;
+  if (s.empType==="PART") return 0;
+  // 全雇用形態で手動上書き優先
+  const override = month==="9月" ? s.bonus9Amount : s.bonus3Amount;
+  if (override!=null && override!=="") return Number(override);
+  // 自動計算（月数×基本給÷6）
+  const months = month==="9月" ? (s.bonus9Months??6) : (s.bonus3Months??6);
+  return Math.round(s.monthlyBase * months / 6);
+};
+const calcInsMonth = (s,month) => {
+  if (!isWorking(s,month)) return 0;
+  const kaigo    = (s.age>=40 && s.age<=64) ? KAIGO_RATE_COMP : 0;
+  const kosodate = KOSODATE_MONTHS.includes(month) ? KOSODATE_RATE : 0; // 子育て支援金は5月〜・会社負担のみ
+  if (s.empType==="PART") return (s.insOverride??0) + (s.insOverride!=null ? Math.round((s.insOverride/(INS_RATE.health+INS_RATE.pension+INS_RATE.employ+kaigo))*kosodate) : 0);
+  if (s.insOverride!==null && s.insOverride!==undefined) {
+    // 手動上書き時：上書き値＋子育て支援金（標準報酬月額から逆算）
+    const hyojun = getHyojun(s.empType==="EXEC" ? s.monthlyBase : calcMonthlyGross(s,month));
+    return s.insOverride + Math.round(hyojun*kosodate);
+  }
+  if (s.empType==="EXEC") return Math.round(getHyojun(s.monthlyBase)*(INS_RATE.health+INS_RATE.pension+kaigo+kosodate));
+  const gross = calcMonthlyGross(s,month);
+  return Math.round(getHyojun(gross)*(INS_RATE.health+INS_RATE.pension+INS_RATE.employ+kaigo+kosodate));
+};
+const calcBonusInsMonth = (s,month) => {
+  const override = month==="9月" ? s.bonus9InsOverride : s.bonus3InsOverride;
+  const bonus = calcBonus(s,month);
+  if (!bonus) return 0;
+  const kosodate = KOSODATE_MONTHS.includes(month) ? KOSODATE_RATE : 0;
+  if (override !== null && override !== undefined) {
+    // 手動上書き時：上書き値＋子育て支援金
+    return override + Math.round(Math.min(bonus,1500000)*kosodate);
+  }
+  if (s.empType==="EXEC") return Math.round(calcBonusIns(bonus)*((INS_RATE.health+INS_RATE.pension+kosodate)/(INS_RATE.health+INS_RATE.pension+INS_RATE.employ)));
+  if (s.empType==="PART") return 0;
+  return Math.round(Math.min(bonus,1500000)*(INS_RATE.health+INS_RATE.pension+INS_RATE.employ+kosodate));
+};
+const calcMonthlyTotal = (s,month) =>
+  calcMonthlyGross(s,month)+calcInsMonth(s,month)+(BONUS_MONTHS.includes(month)?calcBonus(s,month)+calcBonusInsMonth(s,month):0);
+const calcAnnualTotal = (s) => MONTHS.reduce((sum,m)=>sum+calcMonthlyTotal(s,m),0);
+
+// ══════════════════════════════════════════════
+//  手取り計算
+// ══════════════════════════════════════════════
+// 本人負担社保率
+const EMP_INS_RATE = { health:0.04965, pension:0.0915, employ:0.0060 }; // 愛知県協会けんぽ2026年度
+const KAIGO_RATE_EMP  = 0.00810; // 介護保険本人負担（40-64歳）1.62%/2
+const KAIGO_RATE_COMP = 0.00810; // 介護保険会社負担（40-64歳）1.62%/2
+
+// 本人負担社保（月）
+const calcEmpInsMonth = (s, month) => {
+  if (!isWorking(s,month)) return 0;
+  if (s.empType==="PART") return 0;
+  // 手動上書きがある場合はそれを本人負担社保として使用
+  // （会社負担と本人負担は原則折半のため同額）
+  if (s.insOverride !== null && s.insOverride !== undefined) return s.insOverride;
+  const gross  = calcMonthlyGross(s, month);
+  const hyojun = getHyojun(gross);
+  const kaigo  = (s.age>=40 && s.age<=64) ? KAIGO_RATE_EMP : 0;
+  if (s.empType==="EXEC") return Math.round(hyojun*(EMP_INS_RATE.health+EMP_INS_RATE.pension+kaigo));
+  return Math.round(hyojun*(EMP_INS_RATE.health+EMP_INS_RATE.pension+EMP_INS_RATE.employ+kaigo));
+};
+
+// 給与所得控除（年収ベース）
+const calcKyuyoKojo = (nenShu) => {
+  if (nenShu <= 1625000)  return 550000;
+  if (nenShu <= 1800000)  return Math.round(nenShu * 0.40 - 100000);
+  if (nenShu <= 3600000)  return Math.round(nenShu * 0.30 + 80000);
+  if (nenShu <= 6600000)  return Math.round(nenShu * 0.20 + 440000);
+  if (nenShu <= 8500000)  return Math.round(nenShu * 0.10 + 1100000);
+  return 1950000;
+};
+
+// 簡易所得税（月次・扶養0人ベース）
+const calcIncomeTaxMonth = (s, month) => {
+  if (!isWorking(s,month)) return 0;
+  if (s.incomeTaxOverride !== null && s.incomeTaxOverride !== undefined) return s.incomeTaxOverride;
+  const gross = calcMonthlyGross(s, month);
+  const empIns = calcEmpInsMonth(s, month);
+  const taxable = Math.max(gross - empIns, 0);
+  // 源泉徴収税額表（月額・甲欄・扶養0人）簡易版
+  if (taxable <= 88000)  return 0;
+  if (taxable <= 89000)  return 130;
+  if (taxable <= 90000)  return 180;
+  if (taxable <= 91000)  return 230;
+  if (taxable <= 92000)  return 280;
+  if (taxable <= 95000)  return 360;
+  if (taxable <= 100000) return 520;
+  if (taxable <= 105000) return 690;
+  if (taxable <= 110000) return 860;
+  if (taxable <= 115000) return 1020;
+  if (taxable <= 120000) return 1190;
+  if (taxable <= 125000) return 1350;
+  if (taxable <= 130000) return 1530;
+  if (taxable <= 135000) return 1700;
+  if (taxable <= 140000) return 1880;
+  if (taxable <= 145000) return 2060;
+  if (taxable <= 150000) return 2230;
+  if (taxable <= 160000) return 2570;
+  if (taxable <= 170000) return 2920;
+  if (taxable <= 180000) return 3260;
+  if (taxable <= 190000) return 3610;
+  if (taxable <= 200000) return 3950;
+  if (taxable <= 220000) return 4740;
+  if (taxable <= 240000) return 5540;
+  if (taxable <= 260000) return 6340;
+  if (taxable <= 280000) return 7130;
+  if (taxable <= 300000) return 7930;
+  if (taxable <= 320000) return 8730;
+  if (taxable <= 340000) return 9520;
+  if (taxable <= 360000) return 10320;
+  if (taxable <= 380000) return 11120;
+  if (taxable <= 400000) return 11920;
+  if (taxable <= 420000) return 12720;
+  if (taxable <= 440000) return 13520;
+  if (taxable <= 460000) return 14310;
+  if (taxable <= 480000) return 15110;
+  if (taxable <= 500000) return 15910;
+  // 500,000超：簡易計算
+  return Math.round(taxable * 0.0315 + 60);
+};
+
+// 住民税（月割り簡易計算）
+const calcResidentTaxMonth = (s) => {
+  if (s.residentTaxOverride !== null && s.residentTaxOverride !== undefined) return s.residentTaxOverride;
+  // 年収ベースで試算
+  const nenShu = s.empType==="EXEC" ? s.monthlyBase*12 : s.monthlyBase*12;
+  const kyuyoKojo = calcKyuyoKojo(nenShu);
+  const kisoKojo  = 430000; // 基礎控除
+  const shaKaiFutan = MONTHS.reduce((sum,m)=>sum+calcEmpInsMonth(s,m),0); // 社保年額実績
+  const kazeiShotoku = Math.max(nenShu - kyuyoKojo - kisoKojo - shaKaiFutan, 0);
+  return Math.round(kazeiShotoku * 0.10 / 12);
+};
+
+// 手取り（月）
+const calcTakeHome = (s, month) => {
+  if (!isWorking(s,month)) return 0;
+  const gross   = calcMonthlyGross(s, month);
+  const empIns  = calcEmpInsMonth(s, month);
+  const tax     = calcIncomeTaxMonth(s, month);
+  const resident = calcResidentTaxMonth(s);
+  return Math.max(gross - empIns - tax - resident, 0);
+};
+
+// ══════════════════════════════════════════════
+//  フォーマッター
+// ══════════════════════════════════════════════
+const fmtY = (n) => n===0?"—":`¥${Math.round(n).toLocaleString("ja-JP")}`;
+const fmtM = (n) => n===0?"—":`¥${Math.round(n).toLocaleString("ja-JP")}`;
+const fmtN = (n) => Math.round(n).toLocaleString("ja-JP");
+const fmtDiff = (n) => n===0?"±0":(n>0?`+${fmtN(n)}`:`-${fmtN(Math.abs(n))}`);
+
+const emptyStaff = () => ({
+  id:Date.now(), name:"", empType:"FULL", gradeKey:"AS-1",
+  monthlyBase:120000, skillSalary:120000, careerSalary:0,
+  hourlyWage:1200, monthlyHours:140, posAllowanceIdx:0, overtimeRate:0,
+  commAllowance:0, housingAllowance:0, insOverride:null,
+  bonus9Enable:true, bonus3Enable:true, age:30, workStartMonth:"4月", workEndMonth:"3月", incomeTaxOverride:null, residentTaxOverride:null, bonus9InsOverride:null, bonus3InsOverride:null, note:""
+});
+
+// ══════════════════════════════════════════════
+//  スタイル
+// ══════════════════════════════════════════════
+const CS = {
+  bg:"#f0f2f5", surface:"#ffffff", border:"#e2e8f0", border2:"#cbd5e1",
+  text:"#1e293b", sub:"#64748b", mute:"#94a3b8",
+  blue:"#2563eb", green:"#059669", purple:"#7c3aed", amber:"#d97706",
+};
+const card = (extra={}) => ({background:CS.surface,border:`1px solid ${CS.border}`,borderRadius:14,padding:24,boxShadow:"0 1px 6px rgba(0,0,0,.06)",...extra});
+const iStyle = {width:"100%",background:"#fff",border:`1px solid ${CS.border2}`,color:CS.text,padding:"8px 12px",borderRadius:8,fontSize:13,outline:"none",boxSizing:"border-box"};
+
+// ══════════════════════════════════════════════
+//  メインコンポーネント
+// ══════════════════════════════════════════════
+
+// ── 小コンポーネント ──────────────────────────
+function GradeChip({g, small=false}) {
+  if (!g) return null;
+  const colors = {
+    EN:  {bg:"#f1f5f9",col:"#64748b",border:"#e2e8f0"},
+    "AS-1":{bg:"#f0fdf4",col:"#166534",border:"#bbf7d0"},
+    "AS-2":{bg:"#f0fdf4",col:"#166534",border:"#bbf7d0"},
+    "PR-1":{bg:"#eff6ff",col:"#1d4ed8",border:"#bfdbfe"},
+    "PR-2":{bg:"#eff6ff",col:"#1d4ed8",border:"#bfdbfe"},
+    "PR-3":{bg:"#eff6ff",col:"#1d4ed8",border:"#bfdbfe"},
+    "EX-1":{bg:"#faf5ff",col:"#6d28d9",border:"#e9d5ff"},
+    "EX-2":{bg:"#faf5ff",col:"#6d28d9",border:"#e9d5ff"},
+    "EX-3":{bg:"#faf5ff",col:"#6d28d9",border:"#e9d5ff"},
+    "MS-1":{bg:"#fff7ed",col:"#c2410c",border:"#fed7aa"},
+    "MS-2":{bg:"#fff7ed",col:"#c2410c",border:"#fed7aa"},
+    EXEC: {bg:"#f5f3ff",col:"#5b21b6",border:"#ddd6fe"},
+  };
+  const c = colors[g.key]||colors.EN;
+  return <span style={{fontSize:small?9:10,padding:small?"1px 6px":"2px 8px",borderRadius:20,background:c.bg,color:c.col,fontWeight:700,border:`1px solid ${c.border}`,whiteSpace:"nowrap"}}>{g.label}</span>;
+}
+function Chip({children,col="#64748b",bg="#f1f5f9",border="#e2e8f0"}){
+  return <span style={{fontSize:10,padding:"2px 8px",borderRadius:20,background:bg,color:col,fontWeight:600,border:`1px solid ${border}`}}>{children}</span>;
+}
+function STitle({children}){return <div style={{fontSize:12,fontWeight:700,color:CS.sub,marginBottom:14,letterSpacing:.5}}>{children}</div>;}
+const thS = ({w,sticky,isBonus,right,bg,accentCol}={})=>({padding:"11px 8px",textAlign:right?"right":"center",color:isBonus?CS.purple:accentCol||CS.sub,fontWeight:700,borderBottom:`2px solid ${CS.border}`,fontSize:11,whiteSpace:"nowrap",minWidth:w||72,background:bg||"#f8fafc",...(sticky?{position:"sticky",left:0,zIndex:1}:{})});
+const tdS = ()=>({padding:"10px 8px",borderBottom:`1px solid #f1f5f9`,fontSize:12,color:"#334155"});
+function TRow({label,months,staff,fn,col,bold=false,bg="#f8fafc"}){
+  const totals=months.map(m=>staff.reduce((s,st)=>s+fn(st,m),0));
+  return (
+    <tr style={{background:bg}}>
+      <td colSpan={2} style={{...tdS(),fontWeight:700,color:col,position:"sticky",left:0,background:bg,fontSize:11,borderTop:`2px solid ${CS.border}`}}>{label}</td>
+      {totals.map((t,i)=>(
+        <td key={i} style={{...tdS(),textAlign:"right",fontWeight:bold?700:500,color:BONUS_MONTHS.includes(months[i])?CS.purple:col,borderTop:`2px solid ${CS.border}`,background:BONUS_MONTHS.includes(months[i])?"#faf5ff":bg}}>
+          {fmtM(t)}
+        </td>
+      ))}
+      <td style={{...tdS(),textAlign:"right",fontWeight:700,color:col,background:"#eff6ff",borderTop:`2px solid ${CS.border}`}}>{fmtM(totals.reduce((a,b)=>a+b,0))}</td>
+    </tr>
+  );
+}
+const MLabel  = ({children})=><div style={{fontSize:11,color:CS.sub,marginBottom:6,fontWeight:700}}>{children}</div>;
+const MSect   = ({children})=><div style={{fontSize:11,fontWeight:700,color:CS.sub,borderBottom:`2px solid #f1f5f9`,paddingBottom:6,marginBottom:12,marginTop:18,letterSpacing:.5}}>{children}</div>;
+const MGrid2  = ({children})=><div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>{children}</div>;
+const MGrid3  = ({children})=><div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,marginBottom:12}}>{children}</div>;
+const MField  = ({label,hint,children})=>(
+  <div><div style={{fontSize:10,color:"#94a3b8",marginBottom:4,fontWeight:600}}>{label}{hint&&<span style={{marginLeft:6,color:CS.green,fontSize:9,fontWeight:700}}>（{hint}）</span>}</div>{children}</div>
+);
+const MInput  = ({val,set})=><input style={iStyle} value={val} onChange={e=>set(e.target.value)}/>;
+const MInputN = ({val,set,prefix,suffix,max})=>(
+  <div style={{position:"relative"}}>
+    {prefix&&<span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",fontSize:12,color:CS.mute,pointerEvents:"none"}}>{prefix}</span>}
+    <input type="number" min={0} max={max} style={{...iStyle,paddingLeft:prefix?24:12,paddingRight:suffix?28:12}}
+      value={val} onChange={e=>set(e.target.value===""?"":Number(e.target.value))}/>
+    {suffix&&<span style={{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",fontSize:11,color:CS.mute,pointerEvents:"none"}}>{suffix}</span>}
+  </div>
+);
+
+function App() {
+  const [staff,      setStaff]     = useState(INIT_STAFF);
+  const [tab,        setTab]       = useState("dashboard");
+  const [modal,      setModal]     = useState(null);
+  const [notif,      setNotif]     = useState(null);
+  const [periods,    setPeriods]   = useState(INIT_PERIODS);
+  const [currentPid, setCurrentPid]= useState(21);
+  const [storageReady, setStorageReady] = useState(false);
+  const [periodModal, setPeriodModal]   = useState(false);
+  const [historyData, setHistoryData]   = useState({});
+  const isSwitching = React.useRef(false);
+  const [confirmDel, setConfirmDel] = useState(null); // {id, name} // {pid: annualTotal}
+
+  // ベアシミュレーション状態
+  const [bearAdj, setBearAdj] = useState({
+    skillAdd:0, careerAdd:0,
+    overrides:{} // {[id]:{skillAdd,careerAdd}}
+  });
+  const [showBear, setShowBear] = useState(false);
+
+  // ── ストレージ初期化 ──────────────────────────────────
+  useEffect(() => {
+    (async () => {
+      try {
+        // 期一覧を読み込み
+        const pr = await window.storage.get(SK_PERIODS);
+        const savedPeriods = pr ? JSON.parse(pr.value) : null;
+        if (savedPeriods) setPeriods(savedPeriods);
+
+        // 選択中の期を読み込み
+        const cr = await window.storage.get(SK_CURRENT);
+        const pid = cr ? Number(cr.value) : 21;
+        setCurrentPid(pid);
+
+        // 選択中の期のスタッフを読み込み
+        const sr = await window.storage.get(SK_STAFF(pid));
+        if (sr) setStaff(JSON.parse(sr.value));
+
+        // 全期の年間合計をロード（推移グラフ用）
+        const allPeriods = savedPeriods || INIT_PERIODS;
+        // 第20期は実績値を初期値として使用
+        const hist = { 20: PERIOD_20_DATA }; // 第20期は常に固定値
+        for (const p of allPeriods) {
+          if (p.id === 20) continue; // 第20期は固定値を使うのでスキップ
+          const d  = await window.storage.get(SK_STAFF(p.id));
+          const dh = await window.storage.get(SK_HANKANHI(p.id));
+          const jinkenhi = d  ? JSON.parse(d.value).reduce((s,x)=>s+calcAnnualTotal(x),0) : 0;
+          const hItems   = dh ? JSON.parse(dh.value) : [];
+          const hankanhi = Object.values(HANKANHI_BASE_20).reduce((a,b)=>a+b,0)
+            + MONTHS.reduce((s,m)=>s+hItems.reduce((ss,item)=>{
+              if(item.applyType==="monthly"){
+                const si=MONTH_IDX[item.startMonth??"4月"],ei=MONTH_IDX[item.endMonth??"3月"],mi=MONTH_IDX[m];
+                return si<=ei?mi>=si&&mi<=ei?ss+(item.amount||0):ss:mi>=si||mi<=ei?ss+(item.amount||0):ss;
+              } else if(item.applyType==="custom"){
+                let prev2=0;
+                for(const mm of MONTHS){ const v=item.monthlyAmounts?.[mm]; if(v!==undefined&&v!==""&&v!==null) prev2=Number(v); if(mm===m) break; }
+                return ss+prev2;
+              } else { return (item.specificMonths||[]).includes(m)?ss+(item.amount||0):ss; }
+            },0),0);
+          // ストレージ未保存（初回）の場合：第21期はINIT_STAFFで計算
+          const effectiveJinkenhi = jinkenhi>0 ? jinkenhi
+            : p.id===21 ? INIT_STAFF.reduce((s,x)=>s+calcAnnualTotal(x),0) : 0;
+          if (effectiveJinkenhi>0) hist[p.id] = { jinkenhi:effectiveJinkenhi, hankanhi, total:effectiveJinkenhi+hankanhi };
+        }
+        setHistoryData(hist);
+
+        // グレードマスタを読み込み
+        const gm = await window.storage.get(SK_GRADEMASTER(pid));
+        if (gm) setGradeMaster(JSON.parse(gm.value));
+      } catch(e) { /* 初回起動 */ }
+      setStorageReady(true);
+    })();
+  }, []);
+
+  // currentPidをrefでも保持（useEffect内でstaleにならないように）
+  const currentPidRef = React.useRef(currentPid);
+  useEffect(() => { currentPidRef.current = currentPid; }, [currentPid]);
+
+
+  // ── 期切り替え ────────────────────────────────────────
+  const switchPeriod = useCallback(async (pid) => {
+    if (pid === currentPid) return;
+    isSwitching.current = true;
+    // 現在のスタッフを先に保存
+    try { await window.storage.set(SK_STAFF(currentPid), JSON.stringify(staff)); } catch(e) {}
+    // 新しい期のスタッフをストレージから読み込み
+    let newStaff = pid === 21 ? INIT_STAFF.map(s=>({...s})) : [];
+    try {
+      const sr = await window.storage.get(SK_STAFF(pid));
+      if (sr) newStaff = JSON.parse(sr.value);
+    } catch(e) {}
+    // 販管費も切り替え
+    let newHankanhi = [];
+    try {
+      const hr = await window.storage.get(SK_HANKANHI(pid));
+      if (hr) newHankanhi = JSON.parse(hr.value);
+    } catch(e) {}
+    // 一括更新（React batched update）
+    setCurrentPid(pid);
+    setStaff(newStaff);
+    setHankanhiItems(newHankanhi);
+    setBearAdj({skillAdd:0,careerAdd:0,overrides:{}});
+    setShowBear(false);
+    try { await window.storage.set(SK_CURRENT, String(pid)); } catch(e) {}
+    const label = periods.find(p=>p.id===pid)?.label ?? `第${pid}期`;
+    setNotif({msg:`${label}に切り替えました`,type:"ok"});
+    setTimeout(()=>setNotif(null),3000);
+    // グレードマスタも切り替え
+    let newGM = GRADE_MASTER.map(g=>({...g}));
+    try {
+      const gmr = await window.storage.get(SK_GRADEMASTER(pid));
+      if (gmr) newGM = JSON.parse(gmr.value);
+    } catch(e) {}
+    setGradeMaster(newGM);
+    // フラグ解除（次のレンダリング後）
+    setTimeout(()=>{ isSwitching.current = false; }, 500);
+  }, [currentPid, staff, periods]);
+
+  // ── 新しい期を追加 ────────────────────────────────────
+  const addPeriod = useCallback(async (newPeriod) => {
+    const updated = [...periods, newPeriod];
+    setPeriods(updated);
+    await window.storage.set(SK_PERIODS, JSON.stringify(updated));
+    // 前の期のグレードマスタをコピー
+    await window.storage.set(SK_GRADEMASTER(newPeriod.id), JSON.stringify(gradeMaster));
+    // 前の期のスタッフをコピーして新しい期の初期データに
+    const copiedStaff = staff.map(s=>({...s, age: s.age+1,
+      incomeTaxOverride:null, residentTaxOverride:null,
+      insOverride:null, bonus9InsOverride:null, bonus3InsOverride:null
+    }));
+    await window.storage.set(SK_STAFF(newPeriod.id), JSON.stringify(copiedStaff));
+    switchPeriod(newPeriod.id);
+    showNotif(`${newPeriod.label}を追加しました`);
+  }, [periods, staff, switchPeriod]);
+
+  // ── 販管費状態 ─────────────────────────────────────
+  const [hankanhiItems, setHankanhiItems] = useState([]);
+  const [csvModal, setCsvModal] = useState(null);
+  const [hankanhiModal, setHankanhiModal] = useState(null);
+  const [backupText, setBackupText] = useState(null); // バックアップテキスト表示用
+  // グレードマスタ（期ごとに管理）
+  const [gradeMaster, setGradeMaster] = useState(GRADE_MASTER.map(g=>({...g})));
+  const gradeMasterByKey = useMemo(()=>Object.fromEntries(gradeMaster.map(g=>[g.key,g])),[gradeMaster]);
+
+  // 販管費ストレージ読み込み
+  useEffect(() => {
+    if (!storageReady) return;
+    (async () => {
+      try {
+        const hr = await window.storage.get(SK_HANKANHI(currentPid));
+        if (hr) setHankanhiItems(JSON.parse(hr.value));
+        else setHankanhiItems([]);
+      } catch(e) { setHankanhiItems([]); }
+    })();
+  }, [storageReady, currentPid]);
+
+  // 販管費変更時に自動保存
+  useEffect(() => {
+    if (!storageReady) return;
+    if (isSwitching.current) return; // 期切り替え中は保存しない
+    const pid = currentPidRef.current;
+    (async () => {
+      try {
+        await window.storage.set(SK_HANKANHI(pid), JSON.stringify(hankanhiItems));
+      } catch(e) {}
+    })();
+  }, [hankanhiItems, storageReady]);
+
+
+
+  // グレードマスタ変更時に自動保存
+  useEffect(() => {
+    if (!storageReady) return;
+    if (isSwitching.current) return;
+    (async () => {
+      try {
+        await window.storage.set(SK_GRADEMASTER(currentPid), JSON.stringify(gradeMaster));
+      } catch(e) {}
+    })();
+  }, [gradeMaster, storageReady, currentPid]);
+
+  // 月ごとの増減額を計算
+  // custom applyTypeで空欄月は前月と同額を引き継ぐ
+  const resolveCustomAmount = (monthlyAmounts) => {
+    const resolved = {};
+    let prev = 0;
+    for (const m of MONTHS) {
+      const v = monthlyAmounts?.[m];
+      if (v !== undefined && v !== "" && v !== null) { prev = Number(v); }
+      resolved[m] = prev;
+    }
+    return resolved;
+  };
+
+  const calcHankanhiDelta = useCallback((month) => {
+    return hankanhiItems.reduce((sum, item) => {
+      if (item.applyType === "monthly") {
+        const si = MONTH_IDX[item.startMonth ?? "4月"];
+        const ei = MONTH_IDX[item.endMonth   ?? "3月"];
+        const mi = MONTH_IDX[month];
+        const applies = si <= ei ? mi >= si && mi <= ei : mi >= si || mi <= ei;
+        return applies ? sum + (item.amount || 0) : sum;
+      } else if (item.applyType === "custom") {
+        const resolved = resolveCustomAmount(item.monthlyAmounts);
+        return sum + (resolved[month] || 0);
+      } else {
+        return (item.specificMonths || []).includes(month) ? sum + (item.amount || 0) : sum;
+      }
+    }, 0);
+  }, [hankanhiItems]);
+
+  // 月ごとの販管費合計（前年実績＋増減）
+  const calcHankanhiMonth = useCallback((month) => {
+    return (HANKANHI_BASE_20[month] || 0) + calcHankanhiDelta(month);
+  }, [calcHankanhiDelta]);
+
+  // ── スタッフ・販管費変更時に推移データを更新 ──
+  useEffect(() => {
+    if (!storageReady) return;
+    if (isSwitching.current) return;
+    const pid = currentPidRef.current;
+    (async () => {
+      try {
+        await window.storage.set(SK_STAFF(pid), JSON.stringify(staff));
+      } catch(e) {}
+      const jinkenhi = staff.reduce((s,x)=>s+calcAnnualTotal(x),0);
+      const hankanhi = MONTHS.reduce((s,m)=>s+calcHankanhiMonth(m),0);
+      setHistoryData(prev=>({...prev, 20: PERIOD_20_DATA, [pid]: {jinkenhi, hankanhi, total:jinkenhi+hankanhi}}));
+    })();
+  }, [staff, calcHankanhiMonth, storageReady]);
+
+  const showNotif = (msg,type="ok") => { setNotif({msg,type}); setTimeout(()=>setNotif(null),3000); };
+
+  const currentPeriod = useMemo(()=>periods.find(p=>p.id===currentPid)??PERIOD_21,[periods,currentPid]);
+  const activeStaff   = useMemo(()=>staff,[staff]);
+
+  // ベア適用後スタッフリスト
+  // bearStaffは常にベア適用済み（シミュレーション計算用）
+  // showBear=trueのとき経費合計・期別推移にも反映
+  const bearStaff = useMemo(()=>
+    staff.map(s=>applyBear(s,bearAdj))
+  ,[staff,bearAdj]);
+  
+
+  const totalAnnual     = useMemo(()=>staff.reduce((s,st)=>s+calcAnnualTotal(st),0),[staff]);
+
+  // 経費合計（労務費＋販管費）月別
+  const calcMonthlyTotal_all = useCallback((month) => {
+    const jinkenhi = staff.reduce((s,st)=>s+calcMonthlyTotal(st,month),0);
+    return jinkenhi + calcHankanhiMonth(month);
+  }, [staff, calcHankanhiMonth]);
+  const bearTotalAnnual      = useMemo(()=>bearStaff.reduce((s,st)=>s+calcAnnualTotal(st),0),[bearStaff]);
+  const bear_jinkenhi_annual = bearTotalAnnual;
+  const hankanhi_annual      = useMemo(()=>MONTHS.reduce((s,m)=>s+calcHankanhiMonth(m),0),[calcHankanhiMonth]);
+  const bear_sougou_annual   = bear_jinkenhi_annual + hankanhi_annual;
+  const bearDiff             = bear_jinkenhi_annual - totalAnnual;
+  const sougou_annual        = totalAnnual + hankanhi_annual;
+
+  const monthlyTotals = useMemo(()=>
+    MONTHS.map(m=>({
+      month:m,
+      base: staff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0),
+      bear: bearStaff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0),
+    }))
+  ,[staff,bearStaff]);
+  const maxMonthly = useMemo(()=>Math.max(...monthlyTotals.map(m=>m.bear),1),[monthlyTotals]);
+
+  const openEdit = (s) => {
+    // gradeKeyがempTypeと不整合な場合に補正
+    let gradeKey = s.gradeKey;
+    if (s.empType==="EXEC" && gradeKey!=="EXEC") gradeKey = "EXEC";
+    else if (s.empType==="PART" && gradeKey!=="EN") gradeKey = "EN";
+    else if ((s.empType==="FULL"||s.empType==="CONTRACT") && (gradeKey==="EXEC"||gradeKey==="EN")) gradeKey = "AS-1";
+    setModal({mode:"edit", data:{...s, gradeKey}});
+  };
+  const openAdd  = ()  => setModal({mode:"add", data:emptyStaff()});
+  const patchModal = (k,v) => setModal(p=>({...p,data:{...p.data,[k]:v}}));
+
+  // グレード選択時にスキル給を自動セット（期のgradeMasterから参照）
+  const patchGrade = (gradeKey) => {
+    const g = gradeMasterByKey[gradeKey] ?? gradeByKey[gradeKey];
+    if (!g) return;
+    const D = modal.data;
+    const newSkill = g.skillSalary;
+    patchModal("gradeKey", gradeKey);
+    patchModal("skillSalary", newSkill);
+    patchModal("monthlyBase", newSkill+(D.careerSalary||0));
+  };
+
+  const saveModal = () => {
+    const d = modal.data;
+    if (!d.name.trim()) { showNotif("名前を入力してください","err"); return; }
+    if (modal.mode==="add") { setStaff(p=>[...p,{...d,id:Date.now()}]); showNotif("追加しました"); }
+    else { setStaff(p=>p.map(s=>s.id===d.id?d:s)); showNotif("保存しました"); }
+    setModal(null);
+  };
+
+  const deleteStaff = (id, name) => {
+    setConfirmDel({id, name});
+  };
+  const confirmDeleteExec = () => {
+    if (!confirmDel) return;
+    setStaff(p=>p.filter(s=>s.id!==confirmDel.id));
+    setModal(null);
+    setConfirmDel(null);
+    showNotif(`${confirmDel.name} を削除しました`);
+  };
+
+  // ── エクスポート ─────────────────────────────────────
+  const exportData = async () => {
+    // 全期の販管費・グレードマスタも収集
+    const hankanhiByPeriod = {};
+    const gradeMasterByPeriod = {};
+    for (const p of periods) {
+      try {
+        const hr = await window.storage.get(SK_HANKANHI(p.id));
+        if (hr) hankanhiByPeriod[p.id] = JSON.parse(hr.value);
+        const gr = await window.storage.get(SK_GRADEMASTER(p.id));
+        if (gr) gradeMasterByPeriod[p.id] = JSON.parse(gr.value);
+      } catch(e) {}
+    }
+    // 全期のスタッフも収集
+    const staffByPeriodAll = { [currentPid]: staff };
+    for (const p of periods) {
+      if (p.id === currentPid) continue;
+      try {
+        const sr = await window.storage.get(SK_STAFF(p.id));
+        if (sr) staffByPeriodAll[p.id] = JSON.parse(sr.value);
+      } catch(e) {}
+    }
+    const payload = {
+      version: 2,
+      exportedAt: new Date().toISOString(),
+      periods,
+      currentPeriod: currentPid,
+      staffByPeriod: staffByPeriodAll,
+      hankanhiByPeriod,
+      gradeMasterByPeriod,
+    };
+    const json = JSON.stringify(payload, null, 2);
+    try {
+      await navigator.clipboard.writeText(json);
+      showNotif("✅ バックアップをクリップボードにコピーしました。メモ帳等に貼り付けて保存してください。");
+    } catch(e) {
+      // フォールバック：textareaで選択させる
+      setBackupText(json);
+    }
+  };
+
+  // ── インポート ─────────────────────────────────────
+  const [restoreText, setRestoreText] = useState(null); // 復元テキスト入力モーダル
+
+  const importFromText = async (jsonText) => {
+    try {
+      const payload = JSON.parse(jsonText);
+      if (!payload.version || !payload.staffByPeriod) throw new Error("invalid");
+      const merged = [...periods];
+      for (const p of (payload.periods??[])) {
+        if (!merged.find(x=>x.id===p.id)) merged.push(p);
+      }
+      setPeriods(merged);
+      await window.storage.set(SK_PERIODS, JSON.stringify(merged));
+      // スタッフ復元（全期）
+      for (const [pid, st] of Object.entries(payload.staffByPeriod)) {
+        await window.storage.set(SK_STAFF(Number(pid)), JSON.stringify(st));
+      }
+      // 販管費復元
+      if (payload.hankanhiByPeriod) {
+        for (const [pid, items] of Object.entries(payload.hankanhiByPeriod)) {
+          await window.storage.set(SK_HANKANHI(Number(pid)), JSON.stringify(items));
+        }
+      }
+      // グレードマスタ復元
+      if (payload.gradeMasterByPeriod) {
+        for (const [pid, gm] of Object.entries(payload.gradeMasterByPeriod)) {
+          await window.storage.set(SK_GRADEMASTER(Number(pid)), JSON.stringify(gm));
+        }
+      }
+      const targetPid = payload.currentPeriod ?? currentPid;
+      const targetStaff = payload.staffByPeriod[targetPid];
+      if (targetStaff) {
+        setStaff(targetStaff);
+        setCurrentPid(targetPid);
+        await window.storage.set(SK_CURRENT, String(targetPid));
+      }
+      // 現在の期の販管費をstateに反映
+      if (payload.hankanhiByPeriod?.[targetPid]) {
+        setHankanhiItems(payload.hankanhiByPeriod[targetPid]);
+      }
+      setRestoreText(null);
+      showNotif("✅ データを復元しました（スタッフ・販管費・グレードマスタ）");
+    } catch(err) {
+      showNotif("❌ JSONの解析に失敗しました。内容を確認してください","err");
+    }
+  };
+
+  const importData = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      try {
+        const payload = JSON.parse(ev.target.result);
+        if (!payload.version || !payload.staffByPeriod) throw new Error("invalid");
+        // 期一覧をマージ
+        const merged = [...periods];
+        for (const p of (payload.periods??[])) {
+          if (!merged.find(x=>x.id===p.id)) merged.push(p);
+        }
+        setPeriods(merged);
+        await window.storage.set(SK_PERIODS, JSON.stringify(merged));
+        // スタッフデータを復元（全期）
+        for (const [pid, st] of Object.entries(payload.staffByPeriod)) {
+          await window.storage.set(SK_STAFF(Number(pid)), JSON.stringify(st));
+        }
+        // 販管費を復元（全期）
+        if (payload.hankanhiByPeriod) {
+          for (const [pid, items] of Object.entries(payload.hankanhiByPeriod)) {
+            await window.storage.set(SK_HANKANHI(Number(pid)), JSON.stringify(items));
+          }
+        }
+        // グレードマスタを復元（全期）
+        if (payload.gradeMasterByPeriod) {
+          for (const [pid, gm] of Object.entries(payload.gradeMasterByPeriod)) {
+            await window.storage.set(SK_GRADEMASTER(Number(pid)), JSON.stringify(gm));
+          }
+        }
+        // 現在の期のスタッフ・販管費をstateに反映
+        const targetPid = payload.currentPeriod ?? currentPid;
+        const targetStaff = payload.staffByPeriod[targetPid];
+        if (targetStaff) {
+          setStaff(targetStaff);
+          setCurrentPid(targetPid);
+          await window.storage.set(SK_CURRENT, String(targetPid));
+        }
+        if (payload.hankanhiByPeriod?.[targetPid]) {
+          setHankanhiItems(payload.hankanhiByPeriod[targetPid]);
+        }
+        showNotif("✅ データを復元しました（スタッフ・販管費・グレードマスタ）");
+      } catch(err) {
+        showNotif("❌ JSONの解析に失敗しました。内容を確認してください","err");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const D = modal?.data;
+  const isExec   = D?.empType==="EXEC";
+  const isPart   = D?.empType==="PART";
+  const hasGrade = D?.empType==="FULL"||D?.empType==="CONTRACT";
+  const hasAllow = D?.empType==="FULL"||D?.empType==="CONTRACT";
+  const firstModalMonth = D ? (MONTHS.find(m=>{
+    const mi=MONTH_IDX[m], si=MONTH_IDX[D.workStartMonth??"4月"], ei=MONTH_IDX[D.workEndMonth??"3月"];
+    return si<=ei ? mi>=si&&mi<=ei : mi>=si||mi<=ei;
+  })??"4月") : "4月";
+
+  // ベアoverride更新
+  const patchOverride = (id, key, val) => {
+    setBearAdj(prev=>({
+      ...prev,
+      overrides:{
+        ...prev.overrides,
+        [id]:{ ...(prev.overrides[id]||{}), [key]: val===''?undefined:Number(val) }
+      }
+    }));
+  };
+  const clearOverride = (id) => {
+    setBearAdj(prev=>{ const o={...prev.overrides}; delete o[id]; return {...prev,overrides:o}; });
+  };
+
+  const ET = EMP_TYPES;
+
+  return (
+    <div style={{fontFamily:"'Noto Sans JP','Hiragino Kaku Gothic ProN',sans-serif",background:CS.bg,minHeight:"100vh",color:CS.text}}>
+
+      {notif && (
+        <div style={{position:"fixed",top:16,right:16,zIndex:9999,
+          background:notif.type==="ok"?"#166534":"#991b1b",
+          color:"#fff",padding:"10px 20px",borderRadius:10,fontSize:13,fontWeight:600,
+          boxShadow:"0 4px 16px rgba(0,0,0,.2)"}}>
+          {notif.type==="ok"?"✅ ":"⚠️ "}{notif.msg}
+        </div>
+      )}
+
+      {/* ヘッダー */}
+      <div style={{background:"#1e293b",padding:"16px 32px",display:"flex",alignItems:"center",justifyContent:"space-between",boxShadow:"0 2px 8px rgba(0,0,0,.15)"}}>
+        <div style={{display:"flex",alignItems:"center",gap:16}}>
+          <div>
+            <div style={{fontSize:10,color:"#94a3b8",letterSpacing:3,marginBottom:3}}>株式会社エディマート</div>
+            <h1 style={{margin:0,fontSize:19,fontWeight:700,color:"#fff"}}>💼 経費試算システム</h1>
+          </div>
+          {/* 期セレクター */}
+          <div style={{display:"flex",alignItems:"center",gap:8,marginLeft:16}}>
+            <select
+              value={currentPid}
+              onChange={e=>switchPeriod(Number(e.target.value))}
+              style={{background:"rgba(255,255,255,.1)",color:"#fff",border:"1px solid rgba(255,255,255,.2)",
+                borderRadius:8,padding:"6px 12px",fontSize:13,fontWeight:700,cursor:"pointer",outline:"none"}}
+            >
+              {[...periods].reverse().map(p=>(
+                <option key={p.id} value={p.id} style={{background:"#1e293b",color:"#fff"}}>
+                  {p.label} {p.year}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={()=>setPeriodModal(true)}
+              style={{background:"rgba(255,255,255,.1)",color:"#94a3b8",border:"1px solid rgba(255,255,255,.15)",
+                borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer",fontWeight:600}}
+              title="新しい期を追加"
+            >＋ 新しい期</button>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          {showBear && (
+            <div style={{background:"#fef3c7",border:"1px solid #fde68a",borderRadius:10,padding:"8px 16px",textAlign:"center"}}>
+              <div style={{fontSize:10,color:"#92400e",marginBottom:1}}>ベア後　年間増加額</div>
+              <div style={{fontSize:16,fontWeight:700,color:bearTotalAnnual-totalAnnual>0?"#b45309":"#059669"}}>
+                {fmtDiff(bearTotalAnnual-totalAnnual)}円
+              </div>
+            </div>
+          )}
+          {[
+            {label:showBear?"ベア後　人件費":"年間人件費",   val:fmtM(showBear?bearTotalAnnual:totalAnnual), color:"#60a5fa"},
+            {label:"年間販管費", val:fmtM(MONTHS.reduce((s,m)=>s+calcHankanhiMonth(m),0)), color:"#34d399"},
+            {label:"年間経費合計", val:fmtM((showBear?bearTotalAnnual:totalAnnual)+MONTHS.reduce((s,m)=>s+calcHankanhiMonth(m),0)), color:"#a78bfa"},
+          ].map(kpi=>(
+            <div key={kpi.label} style={{background:"rgba(255,255,255,.08)",border:"1px solid rgba(255,255,255,.12)",borderRadius:10,padding:"10px 18px",textAlign:"center",minWidth:120}}>
+              <div style={{fontSize:10,color:"#94a3b8",marginBottom:2}}>{kpi.label}</div>
+              <div style={{fontSize:20,fontWeight:700,color:kpi.color}}>{kpi.val}</div>
+            </div>
+          ))}
+          {/* バックアップボタン */}
+          <div style={{display:"flex",flexDirection:"column",gap:6,marginLeft:8}}>
+            <button onClick={exportData}
+              style={{background:"#059669",color:"#fff",border:"none",borderRadius:8,
+                padding:"7px 14px",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
+              ⬇️ バックアップ
+            </button>
+            <button onClick={()=>setRestoreText("")}
+              style={{background:"rgba(255,255,255,.1)",color:"#94a3b8",border:"1px solid rgba(255,255,255,.2)",
+                borderRadius:8,padding:"7px 14px",fontSize:11,fontWeight:700,cursor:"pointer",textAlign:"center",whiteSpace:"nowrap"}}>
+              ⬆️ 復元
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* タブ */}
+      <div style={{background:CS.surface,borderBottom:`1px solid ${CS.border}`,padding:"0 32px",display:"flex",gap:0,boxShadow:"0 1px 4px rgba(0,0,0,.06)"}}>
+        {[
+          {k:"dashboard", label:"📊 ダッシュボード"},
+          {k:"staff",     label:"👤 スタッフ管理"},
+          {k:"monthly",   label:"📅 月次人件費一覧"},
+          {k:"bear",      label:"📈 ベアシミュレーション"},
+          {k:"grademap",  label:"🗺 キャリアマップ"},
+          {k:"tax",       label:"🧾 税理士確認"},
+          {k:"hankanhi",  label:"💰 販管費"},
+          {k:"sougou",    label:"📋 経費合計（人件費＋販管費）"},
+          {k:"history",   label:"📉 期別推移"},
+        ].map(t=>(
+          <button key={t.k} onClick={()=>setTab(t.k)} style={{
+            padding:"14px 20px",border:"none",background:"transparent",cursor:"pointer",
+            fontSize:13,fontWeight:600,
+            color:tab===t.k?CS.blue:CS.sub,
+            borderBottom:tab===t.k?`2px solid ${CS.blue}`:"2px solid transparent",
+            transition:"color .15s"
+          }}>{t.label}</button>
+        ))}
+      </div>
+
+      <div style={{padding:"24px 32px",maxWidth:1440,margin:"0 auto"}}>
+
+        {/* ══ ダッシュボード ══ */}
+        {tab==="dashboard" && (() => {
+          // ── ダッシュボード集計 ──
+          const annualGross   = staff.reduce((s,st)=>s+MONTHS.reduce((a,m)=>a+calcMonthlyGross(st,m),0),0);
+          const annualIns     = staff.reduce((s,st)=>s+MONTHS.reduce((a,m)=>a+calcInsMonth(st,m),0),0);
+          const annualBonus   = staff.reduce((s,st)=>s+BONUS_MONTHS.reduce((a,m)=>a+calcBonus(st,m)+calcBonusInsMonth(st,m),0),0);
+          const annualOT      = staff.reduce((s,st)=>s+MONTHS.reduce((a,m)=>{
+            const rate=st.overtimeRate??0;
+            if(!rate||!isWorking(st,m)) return a;
+            return a+calcOvertimeDetail(st.monthlyBase,calcMonthlyOTHours(rate)).total;
+          },0),0);
+          const pieData = [
+            {label:"基本給与",   val:annualGross-annualOT, color:"#2563eb"},
+            {label:"残業代",     val:annualOT,             color:"#0ea5e9"},
+            {label:"会社社保",   val:annualIns,            color:"#7c3aed"},
+            {label:"賞与+賞与社保", val:annualBonus,       color:"#059669"},
+          ].filter(d=>d.val>0);
+          const pieTotal = pieData.reduce((s,d)=>s+d.val,0);
+          // 円グラフ用SVGパス計算
+          let startAngle = -Math.PI/2;
+          const pieSlices = pieData.map(d=>{
+            const angle = (d.val/pieTotal)*2*Math.PI;
+            const x1=Math.cos(startAngle)*80+100, y1=Math.sin(startAngle)*80+100;
+            startAngle+=angle;
+            const x2=Math.cos(startAngle)*80+100, y2=Math.sin(startAngle)*80+100;
+            const large=angle>Math.PI?1:0;
+            return {...d, path:`M100,100 L${x1},${y1} A80,80 0 ${large},1 ${x2},${y2} Z`};
+          });
+          // 雇用形態別
+          const byType = Object.entries(ET).map(([key,{label,color}])=>{
+            const grp=activeStaff.filter(s=>s.empType===key);
+            const tot=grp.reduce((s,st)=>s+calcAnnualTotal(st),0);
+            return {key,label,color,count:grp.length,tot};
+          }).filter(d=>d.tot>0);
+          return (
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
+
+            {/* ── 月次積み上げ棒グラフ（全幅） ── */}
+            <div style={{gridColumn:"1/-1",...card()}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:8}}>
+                <STitle>月次労務費推移（内訳積み上げ）</STitle>
+                <div style={{display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+                  <div style={{display:"flex",gap:12,fontSize:10,color:CS.sub}}>
+                    {[{c:"#2563eb",l:"基本給与"},{c:"#0ea5e9",l:"残業代"},{c:"#7c3aed",l:"社保"},{c:"#059669",l:"賞与"},{c:"#fbbf24",l:"ベア増分"}].map(({c,l})=>(
+                      <span key={l}><span style={{display:"inline-block",width:10,height:10,background:c,borderRadius:2,marginRight:4}}/>{l}</span>
+                    ))}
+                  </div>
+                  <label style={{display:"flex",alignItems:"center",gap:7,fontSize:12,color:CS.sub,cursor:"pointer"}}>
+                    <input type="checkbox" checked={showBear} onChange={e=>setShowBear(e.target.checked)} style={{accentColor:CS.purple,width:14,height:14}}/>
+                    ベア後を重ねて表示
+                  </label>
+                </div>
+              </div>
+              <div style={{display:"flex",alignItems:"flex-end",gap:4,height:180,padding:"0 4px"}}>
+                {MONTHS.map(month=>{
+                  const isBonus = BONUS_MONTHS.includes(month);
+                  const mGross  = staff.reduce((s,st)=>s+calcMonthlyGross(st,month),0);
+                  const mOT     = staff.reduce((s,st)=>{
+                    const rate=st.overtimeRate??0;
+                    if(!rate||!isWorking(st,month)) return s;
+                    return s+calcOvertimeDetail(st.monthlyBase,calcMonthlyOTHours(rate)).total;
+                  },0);
+                  const mBase   = mGross - mOT;
+                  const mIns    = staff.reduce((s,st)=>s+calcInsMonth(st,month),0);
+                  const mBonus  = isBonus ? staff.reduce((s,st)=>s+calcBonus(st,month)+calcBonusInsMonth(st,month),0) : 0;
+                  const mTotal  = mBase+mOT+mIns+mBonus;
+                  const bearTotal = showBear ? bearStaff.reduce((s,st)=>s+calcMonthlyTotal(st,month),0) : mTotal;
+                  const maxVal  = Math.max(...MONTHS.map(m=>{
+                    const bg=staff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0);
+                    return showBear?Math.max(bg,bearStaff.reduce((s2,st)=>s2+calcMonthlyTotal(st,m),0)):bg;
+                  }),1);
+                  const scale = 160/maxVal;
+                  const bearExtra = showBear&&bearTotal>mTotal ? (bearTotal-mTotal)*scale : 0;
+                  const segments = [
+                    {val:mBase*scale,  color:"#2563eb"},
+                    {val:mOT*scale,    color:"#0ea5e9"},
+                    {val:mIns*scale,   color:"#7c3aed"},
+                    {val:mBonus*scale, color:"#059669"},
+                  ].filter(s=>s.val>0.5);
+                  return (
+                    <div key={month} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center"}}>
+                      <div style={{fontSize:9,color:CS.sub,marginBottom:3,fontWeight:600,whiteSpace:"nowrap"}}>
+                        {fmtM(showBear?bearTotal:mTotal)}
+                      </div>
+                      <div style={{width:"100%",display:"flex",flexDirection:"column",alignItems:"center",gap:0}}>
+                        {bearExtra>0&&<div style={{width:"75%",height:bearExtra,background:"#fbbf24",borderRadius:"3px 3px 0 0"}}/>}
+                        {[...segments].reverse().map((seg,i)=>(
+                          <div key={i} style={{
+                            width:bearExtra>0?"75%":"100%",
+                            height:seg.val,
+                            background:seg.color,
+                            borderRadius:i===segments.length-1?"3px 3px 0 0":0
+                          }}/>
+                        ))}
+                      </div>
+                      <div style={{fontSize:9,color:isBonus?CS.purple:CS.sub,marginTop:4,textAlign:"center",fontWeight:600}}>
+                        {month}{isBonus&&<div style={{fontSize:8,color:CS.purple}}>賞与月</div>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* ── 費用構成ドーナツ（人件費 vs 販管費） ── */}
+            <div style={card()}>
+              <STitle>費用構成（年間）</STitle>
+              {(() => {
+                const hankanhi_y = MONTHS.reduce((s,m)=>s+calcHankanhiMonth(m),0);
+                const total_y    = totalAnnual + hankanhi_y;
+                const pie2 = [
+                  {label:"人件費", val:totalAnnual,  color:CS.blue},
+                  {label:"販管費", val:hankanhi_y,   color:CS.purple},
+                ];
+                let ang2 = -Math.PI/2;
+                const slices2 = pie2.map(d=>{
+                  const a=(d.val/total_y)*2*Math.PI;
+                  const x1=Math.cos(ang2)*80+100,y1=Math.sin(ang2)*80+100;
+                  ang2+=a;
+                  const x2=Math.cos(ang2)*80+100,y2=Math.sin(ang2)*80+100;
+                  return {...d,path:`M100,100 L${x1},${y1} A80,80 0 ${a>Math.PI?1:0},1 ${x2},${y2} Z`};
+                });
+                return (
+                  <div style={{display:"flex",alignItems:"center",gap:20,flexWrap:"wrap"}}>
+                    <svg width="200" height="200" style={{flexShrink:0}}>
+                      {slices2.map((s,i)=>(
+                        <path key={i} d={s.path} fill={s.color} stroke="#fff" strokeWidth="2"/>
+                      ))}
+                      <circle cx="100" cy="100" r="48" fill="#fff"/>
+                      <text x="100" y="95" textAnchor="middle" fontSize="10" fill="#64748b">経費合計</text>
+                      <text x="100" y="113" textAnchor="middle" fontSize="12" fontWeight="700" fill="#1e293b">
+                        {(total_y/10000/10000).toFixed(2)}億
+                      </text>
+                    </svg>
+                    <div style={{flex:1,display:"flex",flexDirection:"column",gap:14}}>
+                      {pie2.map(d=>(
+                        <div key={d.label}>
+                          <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:4}}>
+                            <span style={{display:"flex",alignItems:"center",gap:6}}>
+                              <span style={{width:10,height:10,borderRadius:2,background:d.color,display:"inline-block"}}/>
+                              {d.label}
+                            </span>
+                            <span style={{fontWeight:700,color:d.color}}>{fmtM(d.val)}</span>
+                          </div>
+                          <div style={{background:CS.border,borderRadius:4,height:8,overflow:"hidden"}}>
+                            <div style={{width:`${d.val/total_y*100}%`,height:"100%",background:d.color,borderRadius:4}}/>
+                          </div>
+                          <div style={{fontSize:10,color:CS.mute,textAlign:"right",marginTop:2}}>
+                            {(d.val/total_y*100).toFixed(1)}%　月平均 {fmtM(Math.round(d.val/12))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* ── 販管費 月別棒グラフ（前年実績 vs 21期試算） ── */}
+            <div style={{gridColumn:"1/-1",...card()}}>
+              <STitle>販管費 月別推移（前年実績 vs 21期試算）</STitle>
+              <div style={{display:"flex",gap:12,fontSize:10,color:CS.sub,marginBottom:12}}>
+                <span><span style={{display:"inline-block",width:10,height:10,background:"#e2e8f0",border:"1px solid #94a3b8",borderRadius:2,marginRight:4}}/>前年実績</span>
+                <span><span style={{display:"inline-block",width:10,height:10,background:CS.purple,borderRadius:2,marginRight:4}}/>21期試算</span>
+              </div>
+              <div style={{display:"flex",alignItems:"flex-end",gap:4,height:160}}>
+                {MONTHS.map(m=>{
+                  const base21 = calcHankanhiMonth(m);
+                  const base20 = HANKANHI_BASE_20[m]||0;
+                  const maxV   = Math.max(...MONTHS.map(mx=>Math.max(calcHankanhiMonth(mx),HANKANHI_BASE_20[mx]||0)),1);
+                  const scale  = 140/maxV;
+                  const h21    = Math.max(base21*scale, 2);
+                  const h20    = Math.max(base20*scale, 2);
+                  const up     = base21 > base20;
+                  const isBonus= BONUS_MONTHS.includes(m);
+                  return (
+                    <div key={m} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center"}}>
+                      <div style={{fontSize:9,color:CS.sub,marginBottom:3,whiteSpace:"nowrap"}}>
+                        {fmtM(base21)}
+                      </div>
+                      <div style={{width:"100%",display:"flex",gap:"8%",alignItems:"flex-end",justifyContent:"center"}}>
+                        <div style={{width:"38%",height:h20,background:"#e2e8f0",border:"1px solid #94a3b8",borderRadius:"3px 3px 0 0"}}/>
+                        <div style={{width:"38%",height:h21,
+                          background:up?"#dc2626":CS.purple,
+                          borderRadius:"3px 3px 0 0",
+                          opacity:0.9}}/>
+                      </div>
+                      <div style={{fontSize:9,color:isBonus?CS.purple:CS.sub,marginTop:4,textAlign:"center",fontWeight:600}}>
+                        {m}
+                        {base21!==base20&&<div style={{fontSize:8,color:up?"#dc2626":"#059669"}}>
+                          {up?"▲":"▼"}{fmtM(Math.abs(base21-base20))}
+                        </div>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* ── 経費合計 月別グラフ（人件費＋販管費積み上げ） ── */}
+            <div style={{gridColumn:"1/-1",...card()}}>
+              <STitle>経費合計 月別グラフ（人件費＋販管費）</STitle>
+              <div style={{display:"flex",gap:12,fontSize:10,color:CS.sub,marginBottom:12}}>
+                <span><span style={{display:"inline-block",width:10,height:10,background:CS.blue,borderRadius:2,marginRight:4}}/>人件費</span>
+                <span><span style={{display:"inline-block",width:10,height:10,background:CS.purple,borderRadius:2,marginRight:4}}/>販管費</span>
+                <span><span style={{display:"inline-block",width:10,height:10,background:"#e2e8f0",border:"1px dashed #94a3b8",borderRadius:2,marginRight:4}}/>前期実績</span>
+              </div>
+              <div style={{display:"flex",alignItems:"flex-end",gap:4,height:180}}>
+                {MONTHS.map(m=>{
+                  const jin  = staff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0);
+                  const han  = calcHankanhiMonth(m);
+                  const tot  = jin+han;
+                  const prev20 = ({"4月":7735030,"5月":6912696,"6月":7138354,"7月":7604106,"8月":7020866,
+                    "9月":9755843,"10月":7429445,"11月":7223820,"12月":7426367,
+                    "1月":7928578,"2月":7408546,"3月":10253994})[m]||0;
+                  const maxV = Math.max(...MONTHS.map(mx=>{
+                    return staff.reduce((s,st)=>s+calcMonthlyTotal(st,mx),0)+calcHankanhiMonth(mx);
+                  }),prev20*1.1,1);
+                  const scale = 160/maxV;
+                  const hJin  = Math.max(jin*scale,2);
+                  const hHan  = Math.max(han*scale,2);
+                  const hPrev = prev20*scale;
+                  const isBonus=BONUS_MONTHS.includes(m);
+                  return (
+                    <div key={m} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center"}}>
+                      <div style={{fontSize:9,color:CS.sub,marginBottom:3,whiteSpace:"nowrap"}}>{fmtM(tot)}</div>
+                      <div style={{width:"100%",display:"flex",flexDirection:"column",alignItems:"center",position:"relative"}}>
+                        <div style={{position:"absolute",bottom:hPrev,left:0,right:0,
+                          borderTop:"2px dashed #94a3b8",zIndex:1}}/>
+                        <div style={{width:"75%",height:hHan,background:CS.purple,borderRadius:"3px 3px 0 0"}}/>
+                        <div style={{width:"75%",height:hJin,background:CS.blue}}/>
+                      </div>
+                      <div style={{fontSize:9,color:isBonus?CS.purple:CS.sub,marginTop:4,textAlign:"center",fontWeight:600}}>
+                        {m}{isBonus&&<div style={{fontSize:8}}>賞与月</div>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+          </div>
+          );
+        })()}
+
+        {/* ══ スタッフ管理 ══ */}
+        {tab==="staff" && (
+          <div>
+            {staff.length===0 && (
+              <div style={{...card(),textAlign:"center",padding:"40px 0",marginBottom:20}}>
+                <div style={{fontSize:32,marginBottom:12}}>📁</div>
+                <div style={{fontSize:14,fontWeight:700,color:CS.text,marginBottom:6}}>
+                  {currentPeriod.label}はスタッフデータがありません
+                </div>
+                <div style={{fontSize:12,color:CS.mute}}>
+                  実績期のため編集不要です。第21期に切り替えてください。
+                </div>
+              </div>
+            )}
+            <div style={{display:"flex",justifyContent:"flex-end",marginBottom:18}}>
+              <button onClick={openAdd} style={{background:CS.blue,color:"#fff",border:"none",padding:"10px 22px",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:700,boxShadow:"0 2px 8px rgba(37,99,235,.3)"}}>
+                ＋ スタッフを追加
+              </button>
+            </div>
+            {Object.entries(ET).map(([key,{label,color}])=>{
+              const grp=staff.filter(s=>s.empType===key);
+              if(!grp.length) return null;
+              return (
+                <div key={key} style={{marginBottom:28}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10,paddingBottom:8,borderBottom:`2px solid ${color}22`}}>
+                    <div style={{width:13,height:13,borderRadius:4,background:color}}/>
+                    <span style={{fontSize:14,fontWeight:700}}>{label}</span>
+                    <span style={{fontSize:11,color:CS.mute}}>{grp.length}名在籍</span>
+                  </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {grp.map(s=>{
+                      const firstMonth = MONTHS.find(m=>isWorking(s,m)) ?? "4月";
+                      const monthly4=calcMonthlyTotal(s,firstMonth);
+                      const annual=calcAnnualTotal(s);
+                      const ins4=calcInsMonth(s,firstMonth);
+                      const bonus9Ins=calcBonusInsMonth(s,"9月");
+                      const bonus3Ins=calcBonusInsMonth(s,"3月");
+                      const gm=gradeByKey[s.gradeKey];
+                      return (
+                        <div key={s.id} style={{
+                          background:CS.surface,border:`1px solid ${CS.border}`,
+                          borderLeft:`4px solid ${color}`,
+                          borderRadius:10,padding:"14px 18px",opacity:1,
+                          display:"flex",alignItems:"center",gap:16,
+                          boxShadow:"0 1px 4px rgba(0,0,0,.05)"
+                        }}>
+                          <div style={{width:40,height:40,borderRadius:"50%",flexShrink:0,background:`${color}18`,border:`2px solid ${color}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:700,color}}>
+                            {s.name[0]}
+                          </div>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{display:"flex",alignItems:"center",gap:7,flexWrap:"wrap",marginBottom:5}}>
+                              <span style={{fontSize:14,fontWeight:700}}>{s.name}</span>
+                              <GradeChip g={gm}/>
+                              {(s.workStartMonth!=="4月"||s.workEndMonth!=="3月")&&<Chip col="#0369a1" bg="#e0f2fe" border="#bae6fd">{s.workStartMonth??"4月"}〜{s.workEndMonth??"3月"}</Chip>}
+                        {s.age>=40&&s.age<=64&&<Chip col="#92400e" bg="#fef3c7" border="#fde68a">介護保険</Chip>}
+                              
+                              {s.note&&<span style={{fontSize:10,color:CS.mute}}>※{s.note}</span>}
+                            </div>
+                            <div style={{display:"flex",gap:14,fontSize:11,color:CS.sub,flexWrap:"wrap"}}>
+                              {key==="PART"
+                                ?<span>時給 <b style={{color:CS.text}}>¥{s.hourlyWage.toLocaleString()}</b>×<b style={{color:CS.text}}>{s.monthlyHours}h</b></span>
+                                :<>
+                                  {(key==="FULL"||key==="CONTRACT")&&<>
+                                    <span>スキル <b style={{color:CS.text}}>{fmtY(s.skillSalary??0)}</b></span>
+                                    <span>キャリア <b style={{color:CS.text}}>{fmtY(s.careerSalary??0)}</b></span>
+                                    <span>計 <b style={{color:CS.blue}}>{fmtY(s.monthlyBase)}</b></span>
+                                  </>}
+                                  {key==="EXEC"&&<span>月額報酬 <b style={{color:CS.text}}>{fmtY(s.monthlyBase)}</b></span>}
+                                </>
+                              }
+                              <span>社保 <b style={{color:CS.text}}>{ins4===0?"—":fmtY(ins4)}</b>/月</span>
+                              {(s.bonus9Enable||s.bonus3Enable)&&<span>賞与 <b style={{color:CS.purple}}>{[s.bonus9Enable&&"9月",s.bonus3Enable&&"3月"].filter(Boolean).join("・")}</b></span>}
+                            </div>
+                          </div>
+                          <div style={{textAlign:"right",flexShrink:0}}>
+                            <div style={{display:"flex",gap:16,alignItems:"flex-start"}}>
+                              <div>
+                                <div style={{fontSize:10,color:CS.mute,marginBottom:2}}>会社負担（月）</div>
+                                <div style={{fontSize:17,fontWeight:700,color}}>{fmtM(monthly4)}</div>
+                                <div style={{fontSize:10,color:CS.mute}}>年間 {fmtM(annual)}</div>
+                              </div>
+                              <div style={{borderLeft:`1px solid ${CS.border}`,paddingLeft:16}}>
+                                <div style={{fontSize:10,color:CS.mute,marginBottom:2}}>手取り（月）</div>
+                                <div style={{fontSize:17,fontWeight:700,color:CS.green}}>{fmtM(calcTakeHome(s,firstMonth))}</div>
+                                <div style={{fontSize:10,color:CS.mute}}>
+                                  {s.empType==="PART"
+                                    ? `税 ${fmtM(calcIncomeTaxMonth(s,firstMonth)+calcResidentTaxMonth(s))}`
+                                    : `社保+税 ${fmtM(calcEmpInsMonth(s,firstMonth)+calcIncomeTaxMonth(s,firstMonth)+calcResidentTaxMonth(s))}`
+                                  }
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                          <button onClick={()=>openEdit(s)} style={{background:"transparent",color:CS.blue,border:`1px solid #bfdbfe`,padding:"7px 16px",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,flexShrink:0}}>編集</button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* ══ 月次一覧 ══ */}
+        {tab==="monthly" && (
+          <div style={{display:"flex",flexDirection:"column",gap:16}}>
+
+            {/* ── 共通テーブルヘッダーコンポーネント ── */}
+            {[
+              {
+                title:"💴 給与一覧",
+                color:CS.text,
+                bg:"#f8fafc",
+                borderCol:"#e2e8f0",
+                fn:(s,m)=>calcMonthlyGross(s,m)+(BONUS_MONTHS.includes(m)?calcBonus(s,m):0),
+                annualFn:s=>MONTHS.reduce((a,m)=>a+calcMonthlyGross(s,m),0)+BONUS_MONTHS.reduce((a,m)=>a+calcBonus(s,m),0),
+              },
+              {
+                title:"🏥 社保一覧（会社負担）",
+                color:CS.green,
+                bg:"#f0fdf4",
+                borderCol:"#bbf7d0",
+                fn:(s,m)=>calcInsMonth(s,m)+(BONUS_MONTHS.includes(m)?calcBonusInsMonth(s,m):0),
+                annualFn:s=>MONTHS.reduce((a,m)=>a+calcInsMonth(s,m),0)+BONUS_MONTHS.reduce((a,m)=>a+calcBonusInsMonth(s,m),0),
+              },
+              {
+                title:"📊 合計一覧（給与＋社保）",
+                color:CS.blue,
+                bg:"#eff6ff",
+                borderCol:"#bfdbfe",
+                fn:calcMonthlyTotal,
+                annualFn:calcAnnualTotal,
+              },
+            ].map(({title,color,bg,borderCol,fn,annualFn})=>(
+              <div key={title} style={{...card(),padding:0,overflow:"hidden"}}>
+                <div style={{padding:"10px 16px",background:bg,borderBottom:`1px solid ${borderCol}`,fontWeight:700,fontSize:13,color}}>
+                  {title}
+                </div>
+                <div style={{overflowX:"auto"}}>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:900}}>
+                    <thead>
+                      <tr style={{background:bg}}>
+                        <th style={thS({w:88,sticky:true,bg})}>氏名</th>
+                        <th style={thS({w:72,bg})}>種別</th>
+                        {MONTHS.map(m=>(
+                          <th key={m} style={thS({isBonus:BONUS_MONTHS.includes(m),bg})}>
+                            {m}{BONUS_MONTHS.includes(m)&&<div style={{fontSize:8,color:CS.purple,fontWeight:700}}>賞与月</div>}
+                          </th>
+                        ))}
+                        <th style={thS({w:88,right:true,bg,accentCol:color})}>年間合計</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {activeStaff.map((s,i)=>{
+                        const col=ET[s.empType].color;
+                        const rowBg=i%2===0?"#fff":bg;
+                        return (
+                          <tr key={s.id} style={{background:rowBg}}>
+                            <td style={{...tdS(),fontWeight:700,position:"sticky",left:0,background:rowBg,borderLeft:`3px solid ${col}`,paddingLeft:12}}>
+                              {s.name}
+                            </td>
+                            <td style={tdS()}>
+                              <GradeChip g={gradeByKey[s.gradeKey]} small/>
+                            </td>
+                            {MONTHS.map(m=>{
+                              const val=fn(s,m);
+                              const isB=BONUS_MONTHS.includes(m);
+                              return (
+                                <td key={m} style={{...tdS(),textAlign:"right",
+                                  color:val===0?CS.mute:isB?CS.purple:color,
+                                  background:isB?"#faf5ff":undefined,
+                                  fontWeight:val>0?500:400}}>
+                                  {fmtM(val)}
+                                </td>
+                              );
+                            })}
+                            <td style={{...tdS(),textAlign:"right",fontWeight:700,color:col,background:bg}}>
+                              {fmtM(annualFn(s))}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                    <tfoot>
+                      <TRow label="合計" months={MONTHS} staff={activeStaff} fn={fn} col={color} bold bg={bg}/>
+                    </tfoot>
+                  </table>
+                </div>
+              </div>
+            ))}
+
+          </div>
+        )}
+
+        {/* ══ ベアシミュレーション ══ */}
+        {tab==="bear" && (
+          <div style={{display:"grid",gridTemplateColumns:"360px 1fr",gap:20,alignItems:"start"}}>
+
+            {/* 左：設定パネル */}
+            <div style={{display:"flex",flexDirection:"column",gap:16}}>
+              {/* 一括設定 */}
+              <div style={card()}>
+                <STitle>① 一括ベア設定</STitle>
+                <div style={{display:"flex",flexDirection:"column",gap:14}}>
+                  <div>
+                    <label style={{fontSize:11,color:CS.sub,fontWeight:700,display:"block",marginBottom:6}}>
+                      スキル給　定額加算（全員共通）
+                    </label>
+                    <div style={{position:"relative"}}>
+                      <input type="number" min={0} step={1000}
+                        value={bearAdj.skillAdd}
+                        onChange={e=>setBearAdj(p=>({...p,skillAdd:Number(e.target.value)}))}
+                        style={{...iStyle,paddingRight:28}}/>
+                      <span style={{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",fontSize:11,color:CS.mute}}>円</span>
+                    </div>
+                    <div style={{fontSize:10,color:CS.mute,marginTop:3}}>例：5000 → 全員のスキル給に+¥5,000</div>
+                  </div>
+                  <div>
+                    <label style={{fontSize:11,color:CS.sub,fontWeight:700,display:"block",marginBottom:6}}>
+                      キャリア給　定額加算（全員共通）
+                    </label>
+                    <div style={{position:"relative"}}>
+                      <input type="number" min={0} step={1000}
+                        value={bearAdj.careerAdd}
+                        onChange={e=>setBearAdj(p=>({...p,careerAdd:Number(e.target.value)}))}
+                        style={{...iStyle,paddingRight:28}}/>
+                      <span style={{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",fontSize:11,color:CS.mute}}>円</span>
+                    </div>
+                    <div style={{fontSize:10,color:CS.mute,marginTop:3}}>例：3000 → 全員のキャリア給に+¥3,000</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* 年間影響額サマリー */}
+              <div style={{...card(),background:"#eff6ff",border:`1px solid #bfdbfe`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                  <STitle style={{margin:0}}>年間コスト影響</STitle>
+                  <button onClick={()=>setShowBear(v=>!v)} style={{
+                    padding:"6px 14px",borderRadius:20,border:"none",cursor:"pointer",fontSize:11,fontWeight:700,
+                    background:showBear?"#f59e0b":"#e2e8f0",
+                    color:showBear?"#fff":"#64748b",
+                    transition:"all 0.2s"
+                  }}>
+                    {showBear?"📊 他タブに反映中":"📊 他タブに反映する"}
+                  </button>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                  {[
+                    {label:"現行", val:totalAnnual, col:CS.text},
+                    {label:"ベア後", val:bearTotalAnnual, col:CS.blue},
+                    {label:"増加額", val:bearTotalAnnual-totalAnnual, col:bearTotalAnnual-totalAnnual>0?"#b45309":"#059669", diff:true},
+                    {label:"増加率", val:totalAnnual>0?((bearTotalAnnual-totalAnnual)/totalAnnual*100).toFixed(2):0, col:CS.purple, pct:true},
+                  ].map(k=>(
+                    <div key={k.label} style={{background:"#fff",borderRadius:8,padding:"10px 12px",border:`1px solid ${CS.border}`}}>
+                      <div style={{fontSize:10,color:CS.mute,marginBottom:3}}>{k.label}</div>
+                      <div style={{fontSize:14,fontWeight:700,color:k.col}}>
+                        {k.diff ? fmtDiff(k.val)+"円" : k.pct ? `${k.val}%` : fmtM(k.val)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* 右：個別上書きテーブル */}
+            <div style={card()}>
+              <STitle>② 個別ベア上書き（一括設定を個人ごとに変更）</STitle>
+              <div style={{fontSize:11,color:CS.sub,marginBottom:14}}>
+                空欄の場合は一括設定の値が適用されます。個別に変えたい人だけ入力してください。
+              </div>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead>
+                  <tr style={{background:"#f8fafc"}}>
+                    {["氏名","種別","現在の給与","加算①","加算②","ベア後給与","年間増加額",""].map(h=>(
+                      <th key={h} style={{padding:"8px 10px",textAlign:"left",fontSize:11,color:CS.sub,fontWeight:700,borderBottom:`2px solid ${CS.border}`,whiteSpace:"nowrap"}}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {/* 役員行 */}
+                  {activeStaff.filter(s=>s.empType==="EXEC").map((s,i)=>{
+                    const ov=bearAdj.overrides[s.id]||{};
+                    const execAdd=ov.execAdd!==undefined?ov.execAdd:0;
+                    const newBase=s.monthlyBase+execAdd;
+                    const diffAnnual=execAdd*12;
+                    const hasOv=ov.execAdd!==undefined;
+                    return (
+                      <tr key={s.id} style={{background:i%2===0?"#faf5ff":"#f5f0ff",borderBottom:`1px solid ${CS.border}`}}>
+                        <td style={{padding:"9px 10px",fontWeight:700}}>{s.name}</td>
+                        <td style={{padding:"9px 10px"}}><Chip col="#5b21b6" bg="#f5f3ff" border="#ddd6fe">役員</Chip></td>
+                        <td style={{padding:"9px 10px",color:CS.sub,fontSize:11}}>
+                          月額報酬 <b style={{color:CS.text}}>{fmtY(s.monthlyBase)}</b>
+                        </td>
+                        <td style={{padding:"6px 6px"}}>
+                          <div style={{position:"relative"}}>
+                            <input type="number" min={0} step={1000} placeholder="0"
+                              value={execAdd||""}
+                              onChange={e=>patchOverride(s.id,"execAdd",e.target.value)}
+                              style={{...iStyle,width:90,padding:"5px 22px 5px 8px",fontSize:11,background:hasOv?"#fef3c7":"#fff"}}/>
+                            <span style={{position:"absolute",right:6,top:"50%",transform:"translateY(-50%)",fontSize:9,color:CS.mute}}>円</span>
+                          </div>
+                        </td>
+                        <td style={{padding:"9px 10px",color:CS.mute,fontSize:11}}>—</td>
+                        <td style={{padding:"9px 10px",fontWeight:700,color:newBase!==s.monthlyBase?CS.purple:CS.text}}>{fmtY(newBase)}</td>
+                        <td style={{padding:"9px 10px",fontWeight:700,color:diffAnnual>0?"#b45309":CS.mute}}>
+                          {diffAnnual>0?`+${fmtN(diffAnnual)}円`:"—"}
+                        </td>
+                        <td style={{padding:"6px 10px"}}>
+                          {hasOv&&<button onClick={()=>clearOverride(s.id)} style={{fontSize:10,color:CS.mute,background:"transparent",border:`1px solid ${CS.border}`,borderRadius:5,padding:"2px 8px",cursor:"pointer"}}>リセット</button>}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {/* 正社員・契約社員行 */}
+                  {activeStaff.filter(s=>s.empType!=="EXEC"&&s.empType!=="PART").map((s,i)=>{
+                    const ov = bearAdj.overrides[s.id]||{};
+                    const effSkillAdd  = ov.skillAdd  !== undefined ? ov.skillAdd  : bearAdj.skillAdd;
+                    const effCareerAdd = ov.careerAdd !== undefined ? ov.careerAdd : bearAdj.careerAdd;
+                    const newBase  = (s.skillSalary||0)+effSkillAdd+(s.careerSalary||0)+effCareerAdd;
+                    const diffAnnual = (newBase - s.monthlyBase)*12;
+                    const hasOv = ov.skillAdd!==undefined||ov.careerAdd!==undefined;
+                    const gm=gradeByKey[s.gradeKey];
+                    const col=EMP_TYPES[s.empType].color;
+                    return (
+                      <tr key={s.id} style={{background:i%2===0?"#fff":"#f8fafc",borderBottom:`1px solid ${CS.border}`}}>
+                        <td style={{padding:"9px 10px",fontWeight:700}}>{s.name}</td>
+                        <td style={{padding:"9px 10px"}}><GradeChip g={gm} small/></td>
+                        <td style={{padding:"9px 10px",color:CS.sub,fontSize:11}}>
+                          スキル <b style={{color:CS.text}}>{fmtY(s.skillSalary||0)}</b>
+                          　キャリア <b style={{color:CS.text}}>{fmtY(s.careerSalary||0)}</b>
+                        </td>
+                        <td style={{padding:"6px 6px"}}>
+                          <div style={{position:"relative"}}>
+                            <input type="number" min={0} step={1000} placeholder={`スキル+${bearAdj.skillAdd}`}
+                              value={ov.skillAdd !== undefined ? ov.skillAdd : ""}
+                              onChange={e=>patchOverride(s.id,"skillAdd",e.target.value)}
+                              style={{...iStyle,width:100,padding:"5px 22px 5px 8px",fontSize:10,background:ov.skillAdd!==undefined?"#fef3c7":"#fff"}}/>
+                            <span style={{position:"absolute",right:6,top:"50%",transform:"translateY(-50%)",fontSize:9,color:CS.mute}}>円</span>
+                          </div>
+                        </td>
+                        <td style={{padding:"6px 6px"}}>
+                          <div style={{position:"relative"}}>
+                            <input type="number" min={0} step={1000} placeholder={`キャリア+${bearAdj.careerAdd}`}
+                              value={ov.careerAdd !== undefined ? ov.careerAdd : ""}
+                              onChange={e=>patchOverride(s.id,"careerAdd",e.target.value)}
+                              style={{...iStyle,width:100,padding:"5px 22px 5px 8px",fontSize:10,background:ov.careerAdd!==undefined?"#fef3c7":"#fff"}}/>
+                            <span style={{position:"absolute",right:6,top:"50%",transform:"translateY(-50%)",fontSize:9,color:CS.mute}}>円</span>
+                          </div>
+                        </td>
+                        <td style={{padding:"9px 10px",fontWeight:700,color:newBase!==s.monthlyBase?col:CS.text}}>{fmtY(newBase)}</td>
+                        <td style={{padding:"9px 10px",fontWeight:700,color:diffAnnual>0?"#b45309":CS.mute}}>
+                          {diffAnnual>0?`+${fmtN(diffAnnual)}円`:"—"}
+                        </td>
+                        <td style={{padding:"6px 10px"}}>
+                          {hasOv&&<button onClick={()=>clearOverride(s.id)} style={{fontSize:10,color:CS.mute,background:"transparent",border:`1px solid ${CS.border}`,borderRadius:5,padding:"2px 8px",cursor:"pointer"}}>リセット</button>}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+                <tfoot>
+                  <tr style={{background:"#eff6ff"}}>
+                    <td colSpan={5} style={{padding:"9px 10px",fontWeight:700,color:CS.blue,fontSize:12}}>合計増加額（年間）</td>
+                    <td colSpan={3} style={{padding:"9px 10px",fontWeight:700,color:"#b45309",fontSize:13}}>
+                      {(()=>{
+                        const execDiff=activeStaff.filter(s=>s.empType==="EXEC").reduce((sum,s)=>{
+                          const ov=bearAdj.overrides[s.id]||{};
+                          return sum+(ov.execAdd||0)*12;
+                        },0);
+                        const empDiff=activeStaff.filter(s=>s.empType!=="EXEC"&&s.empType!=="PART").reduce((sum,s)=>{
+                          const ov=bearAdj.overrides[s.id]||{};
+                          const ea=ov.skillAdd!==undefined?ov.skillAdd:bearAdj.skillAdd;
+                          const er=ov.careerAdd!==undefined?ov.careerAdd:bearAdj.careerAdd;
+                          const nb=(s.skillSalary||0)+ea+(s.careerSalary||0)+er;
+                          return sum+(nb-s.monthlyBase)*12;
+                        },0);
+                        const total=execDiff+empDiff;
+                        return total>0?`+${fmtN(total)}円`:"±0円";
+                      })()}
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* ══ グレードマップ ══ */}
+        {tab==="grademap" && (() => {
+          const baseMaster = GRADE_MASTER; // コード上の初期値
+          return (
+          <div style={{display:"flex",flexDirection:"column",gap:20}}>
+            <div style={card()}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                <STitle>キャリアフロー × スキル給マスタ</STitle>
+                <div style={{fontSize:11,color:CS.blue,background:"#eff6ff",border:"1px solid #bfdbfe",
+                  borderRadius:6,padding:"4px 10px",fontWeight:700}}>
+                  {currentPeriod.label} のマスタ
+                </div>
+              </div>
+              <div style={{fontSize:11,color:CS.sub,marginBottom:20}}>
+                スキル給を直接編集できます。変更は<b>{currentPeriod.label}</b>のみに反映されます。
+              </div>
+              <div style={{overflowX:"auto"}}>
+                <table style={{borderCollapse:"collapse",fontSize:12,width:"100%"}}>
+                  <thead>
+                    <tr>
+                      {["グレード","職位","スキル給/月","初期値との差","在籍スタッフ"].map(h=>(
+                        <th key={h} style={{padding:"10px 14px",textAlign:"left",
+                          borderBottom:`2px solid ${CS.border}`,fontSize:11,color:CS.sub,
+                          fontWeight:700,background:"#f8fafc"}}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {gradeMaster.filter(g=>g.key!=="EXEC").map((g,i)=>{
+                      const base = baseMaster.find(b=>b.key===g.key)?.skillSalary??0;
+                      const diff = g.skillSalary - base;
+                      const members = activeStaff.filter(s=>s.gradeKey===g.key);
+                      return (
+                        <tr key={g.key} style={{background:i%2===0?"#fff":"#f8fafc",
+                          borderBottom:`1px solid ${CS.border}`}}>
+                          <td style={{padding:"10px 14px"}}><GradeChip g={g}/></td>
+                          <td style={{padding:"10px 14px",color:CS.sub,fontSize:11}}>{g.desc}</td>
+                          <td style={{padding:"10px 14px"}}>
+                            <div style={{display:"flex",alignItems:"center",gap:8}}>
+                              <input
+                                type="number"
+                                value={g.skillSalary}
+                                step={1000}
+                                onChange={e=>{
+                                  const v = Number(e.target.value);
+                                  setGradeMaster(prev=>prev.map(x=>x.key===g.key?{...x,skillSalary:v}:x));
+                                  // 在籍スタッフのskilllSalary・monthlyBaseも連動更新
+                                  setStaff(prev=>prev.map(s=>{
+                                    if(s.gradeKey!==g.key) return s;
+                                    if(s.empType==="EXEC"||s.empType==="PART") return s;
+                                    return {...s, skillSalary:v, monthlyBase:v+(s.careerSalary||0)};
+                                  }));
+                                }}
+                                style={{width:110,padding:"6px 10px",border:`1px solid ${diff!==0?"#2563eb":CS.border2}`,
+                                  borderRadius:7,fontSize:13,fontWeight:700,
+                                  color:diff!==0?CS.blue:CS.text,
+                                  background:diff!==0?"#eff6ff":"#fff",outline:"none"}}
+                              />
+                              <span style={{fontSize:11,color:CS.mute}}>円</span>
+                              {diff!==0&&(
+                                <button type="button" onClick={()=>{
+                                  setGradeMaster(prev=>prev.map(x=>x.key===g.key?{...x,skillSalary:base}:x));
+                                  setStaff(prev=>prev.map(s=>{
+                                    if(s.gradeKey!==g.key) return s;
+                                    if(s.empType==="EXEC"||s.empType==="PART") return s;
+                                    return {...s, skillSalary:base, monthlyBase:base+(s.careerSalary||0)};
+                                  }));
+                                }} style={{fontSize:10,color:"#dc2626",background:"transparent",
+                                  border:"1px solid #fecaca",borderRadius:5,padding:"3px 7px",cursor:"pointer"}}>
+                                  リセット
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                          <td style={{padding:"10px 14px",fontSize:12,
+                            fontWeight:diff!==0?700:400,
+                            color:diff>0?"#dc2626":diff<0?"#059669":CS.mute}}>
+                            {diff===0?"—":(diff>0?"+":"")+fmtY(diff)}
+                          </td>
+                          <td style={{padding:"10px 14px"}}>
+                            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                              {members.length===0
+                                ? <span style={{color:CS.mute,fontSize:11}}>—</span>
+                                : members.map(s=>(
+                                  <div key={s.id} style={{display:"flex",alignItems:"center",gap:5,
+                                    background:`${ET[s.empType].color}12`,
+                                    border:`1px solid ${ET[s.empType].color}33`,
+                                    borderRadius:20,padding:"3px 10px",fontSize:11}}>
+                                    <span style={{width:6,height:6,borderRadius:"50%",
+                                      background:ET[s.empType].color,display:"inline-block"}}/>
+                                    <span style={{fontWeight:600,color:CS.text}}>{s.name}</span>
+                                    <span style={{fontSize:10,color:CS.mute}}>
+                                      {fmtY(s.skillSalary)}
+                                    </span>
+                                  </div>
+                                ))
+                              }
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            {/* ベアシミュの案内 */}
+            <div style={{...card(),background:"#f0f9ff",border:"1px solid #bae6fd",padding:"16px 20px"}}>
+              <div style={{fontSize:12,color:"#0369a1",fontWeight:700,marginBottom:4}}>💡 運用フロー</div>
+              <div style={{fontSize:11,color:"#0369a1",lineHeight:1.8}}>
+                ① ベアシミュレーションタブで昇給額を検討<br/>
+                ② このマスタで各グレードのスキル給を直接編集・確定<br/>
+                ③ 在籍スタッフのskilllSalary・基本給に即時反映<br/>
+                ④ 新しい期を追加すると、このマスタが次期にコピーされます
+              </div>
+            </div>
+          </div>
+          );
+        })()}
+
+      </div>
+
+      {/* ══ モーダル ══ */}
+      {modal && D && (
+        <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:2000,padding:16}}>
+          <div style={{background:CS.surface,border:`1px solid ${CS.border}`,borderRadius:16,padding:28,width:"100%",maxWidth:600,maxHeight:"92vh",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,.2)"}}>
+            <h3 style={{margin:"0 0 20px",fontSize:16,fontWeight:700}}>{modal.mode==="add"?"スタッフ追加":"スタッフ編集"}</h3>
+
+            <MLabel>雇用形態</MLabel>
+            <div style={{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap"}}>
+              {Object.entries(ET).map(([key,{label,color}])=>(
+                <button type="button" key={key} onClick={()=>{
+                  patchModal("empType", key);
+                  // 雇用形態に合わせてgradeKeyも自動補正
+                  if (key==="EXEC") patchModal("gradeKey","EXEC");
+                  else if (key==="PART") patchModal("gradeKey","EN");
+                  else if (D.gradeKey==="EXEC"||D.gradeKey==="EN") patchModal("gradeKey","AS-1");
+                }} style={{padding:"7px 16px",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:700,border:`1.5px solid ${D.empType===key?color:CS.border}`,background:D.empType===key?`${color}12`:"transparent",color:D.empType===key?color:CS.sub,transition:"all .15s"}}>{label}</button>
+              ))}
+            </div>
+
+            <MGrid2>
+              <MField label="名前 *"><MInput val={D.name} set={v=>patchModal("name",v)}/></MField>
+              {/* グレード選択（役員・アルバイト以外） */}
+              {hasGrade ? (
+                <MField label="グレード（スキル給は自動セット）">
+                  <select style={{...iStyle,cursor:"pointer"}} value={D.gradeKey} onChange={e=>patchGrade(e.target.value)}>
+                    {GRADE_MASTER.filter(g=>g.key!=="EXEC").map(g=>(
+                      <option key={g.key} value={g.key}>{g.label}　{g.skillSalary>0?`（スキル給 ¥${g.skillSalary.toLocaleString()}）`:"（スキル給なし）"}</option>
+                    ))}
+                  </select>
+                </MField>
+              ) : (
+                <MField label="グレード">
+                  <select style={{...iStyle,cursor:"pointer"}} value={D.gradeKey} onChange={e=>patchModal("gradeKey",e.target.value)}>
+                    {GRADE_MASTER.filter(g=>isExec?g.key==="EXEC":g.key!=="EXEC").map(g=>(
+                      <option key={g.key} value={g.key}>{g.label}</option>
+                    ))}
+                  </select>
+                </MField>
+              )}
+            </MGrid2>
+
+            {/* 給与 */}
+            <MSect>給与</MSect>
+            {isExec && <MGrid2><MField label="月額報酬"><MInputN val={D.monthlyBase} set={v=>patchModal("monthlyBase",v)}/></MField></MGrid2>}
+            {hasGrade && (
+              <MGrid3>
+                <MField label="スキル給（月）" hint="グレード連動">
+                  <div style={{padding:"8px 12px",background:"#eff6ff",border:`1px solid #bfdbfe`,borderRadius:8,fontSize:13,color:CS.blue,fontWeight:700}}>
+                    {fmtY(D.skillSalary||0)}
+                  </div>
+                </MField>
+                <MField label="キャリア給（月）"><MInputN val={D.careerSalary??0} set={v=>{patchModal("careerSalary",v);patchModal("monthlyBase",(D.skillSalary||0)+(v||0));}}/></MField>
+                <MField label="基本給合計" hint="自動">
+                  <div style={{padding:"8px 12px",background:"#f0fdf4",border:`1px solid #bbf7d0`,borderRadius:8,fontSize:13,color:CS.green,fontWeight:700}}>
+                    {fmtY((D.skillSalary||0)+(D.careerSalary||0))}
+                  </div>
+                </MField>
+              </MGrid3>
+            )}
+            {isPart && <MGrid2>
+              <MField label="時給"><MInputN val={D.hourlyWage} set={v=>patchModal("hourlyWage",v)} prefix="¥"/></MField>
+              <MField label="月間労働時間"><MInputN val={D.monthlyHours} set={v=>patchModal("monthlyHours",v)} suffix="h"/></MField>
+            </MGrid2>}
+
+            {hasAllow && (<>
+              <MSect>手当</MSect>
+              <MGrid2>
+                <MField label="役職手当">
+                  <select style={{...iStyle,cursor:"pointer"}} value={D.posAllowanceIdx} onChange={e=>patchModal("posAllowanceIdx",Number(e.target.value))}>
+                    {POSITION_ALLOWANCES.map((p,i)=><option key={i} value={i}>{p.label}{p.amount?`（¥${p.amount.toLocaleString()}）`:"（なし）"}</option>)}
+                  </select>
+                </MField>
+                <MField label="残業見込み（36協定上限比）" hint="手動上書きがある場合は無効">
+                  <select style={{...iStyle,cursor:"pointer",opacity:D.overtimeAmountOverride!=null&&D.overtimeAmountOverride!==""?0.4:1}}
+                    value={D.overtimeRate??0} onChange={e=>patchModal("overtimeRate",Number(e.target.value))}
+                    disabled={D.overtimeAmountOverride!=null&&D.overtimeAmountOverride!==""}>
+                    {[0,10,20,30,40,50,60,70,80,90,100].map(r=>(
+                      <option key={r} value={r}>{r}%　{r===0?"（残業なし）":`→ 月${Math.min(45*r/100,30).toFixed(1)}h`}</option>
+                    ))}
+                  </select>
+                </MField>
+                <MField label="残業代 手動上書き（月額）" hint="空欄で自動計算に戻る">
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <MInputN val={D.overtimeAmountOverride??""} set={v=>patchModal("overtimeAmountOverride", v===""||v===0?null:Number(v))} prefix="¥"/>
+                    {D.overtimeAmountOverride!=null&&D.overtimeAmountOverride!==""&&(
+                      <button type="button" onClick={()=>patchModal("overtimeAmountOverride",null)}
+                        style={{fontSize:11,color:"#dc2626",background:"transparent",border:"1px solid #fecaca",
+                          borderRadius:6,padding:"4px 8px",cursor:"pointer",whiteSpace:"nowrap"}}>
+                        クリア
+                      </button>
+                    )}
+                  </div>
+                  {D.overtimeAmountOverride!=null&&D.overtimeAmountOverride!==""&&(
+                    <div style={{fontSize:10,color:"#d97706",marginTop:3}}>⚠ 手動上書き中（自動計算は無効）</div>
+                  )}
+                </MField>
+                <MField label="通信費（月）"><MInputN val={D.commAllowance} set={v=>patchModal("commAllowance",v)}/></MField>
+                <MField label="住宅手当（月）"><MInputN val={D.housingAllowance} set={v=>patchModal("housingAllowance",v)}/></MField>
+              </MGrid2>
+              {D.overtimeRate>0&&D.monthlyBase>0&&(()=>{
+                const _otH=calcMonthlyOTHours(D.overtimeRate);
+                const od=calcOvertimeDetail(D.monthlyBase,_otH);
+                return (
+                  <div style={{background:"#f0f9ff",border:"1px solid #bae6fd",borderRadius:8,padding:"10px 14px",marginBottom:14}}>
+                    <div style={{fontSize:11,color:"#0369a1",fontWeight:700,marginBottom:6}}>残業代試算（{calcMonthlyOTHours(D.overtimeRate).toFixed(1)}h/月）：¥{fmtN(od.total)}</div>
+                    <table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
+                      <thead><tr style={{background:"#e0f2fe"}}>
+                        {["区分","時間","割増率","金額"].map(h=><th key={h} style={{padding:"3px 8px",textAlign:h==="金額"?"right":"left",color:"#0369a1",fontWeight:700}}>{h}</th>)}
+                      </tr></thead>
+                      <tbody>
+                        {od.breakdown.map((b,i)=>(
+                          <tr key={i} style={{borderBottom:"1px solid #bae6fd"}}>
+                            <td style={{padding:"3px 8px"}}>{b.label}</td>
+                            <td style={{padding:"3px 8px"}}>{b.hours}h</td>
+                            <td style={{padding:"3px 8px",color:"#0369a1",fontWeight:700}}>×{b.rate.toFixed(2)}</td>
+                            <td style={{padding:"3px 8px",textAlign:"right"}}>¥{fmtN(b.pay)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })()}
+            </>)}
+
+            <MSect>社会保険（会社負担）</MSect>
+            {isExec ? (
+              <><div style={{background:"#f8fafc",border:`1px solid ${CS.border}`,borderRadius:8,padding:"10px 14px",fontSize:11,color:CS.sub,marginBottom:10}}>
+                役員：健保＋厚生年金のみ（雇用保険なし）{(D.age>=40&&D.age<=64)&&"＋介護保険"}　自動試算：<b style={{color:CS.text}}>{D.monthlyBase>0?fmtY(Math.round(getHyojun(D.monthlyBase)*(INS_RATE.health+INS_RATE.pension+((D.age>=40&&D.age<=64)?KAIGO_RATE_COMP:0)))):"—"}</b>/月（4月）　<b style={{color:CS.text}}>{D.monthlyBase>0?fmtY(Math.round(getHyojun(D.monthlyBase)*(INS_RATE.health+INS_RATE.pension+((D.age>=40&&D.age<=64)?KAIGO_RATE_COMP:0)+KOSODATE_RATE))):"—"}</b>/月（5月〜）
+              </div>
+              <MGrid2><MField label="手動上書き（空欄で自動） ※会社・本人とも同額適用" hint="実際の標準報酬月額が異なる場合に入力"><MInputN val={D.insOverride??""} set={v=>patchModal("insOverride",v===""||v===0?null:v)}/></MField></MGrid2></>
+            ):isPart?(
+              <><div style={{background:"#f0f9ff",border:"1px solid #bae6fd",borderRadius:8,padding:"8px 14px",fontSize:11,color:"#0369a1",marginBottom:10}}>
+                <div style={{marginBottom:3}}>自動試算（愛知県協会けんぽ2026年度）　※原則0円・社保加入の場合のみ有効</div>
+                <div style={{lineHeight:1.8}}>
+                  健保 {(INS_RATE.health*100).toFixed(3)}%　厚生年金 {(INS_RATE.pension*100).toFixed(2)}%　雇用保険 {(INS_RATE.employ*100).toFixed(2)}%
+                  {(D.age>=40&&D.age<=64)&&<span>　介護 {(KAIGO_RATE_COMP*100).toFixed(3)}%</span>}
+                  　子育て支援金 {(KOSODATE_RATE*100).toFixed(3)}%（5月〜・会社負担のみ）
+                </div>
+                {(D.hourlyWage>0&&D.monthlyHours>0)&&<div style={{marginTop:4,fontWeight:700}}>
+                  {(()=>{
+                    const gross = D.hourlyWage*D.monthlyHours;
+                    const hyojun = getHyojun(gross);
+                    const kaigo2 = (D.age>=40&&D.age<=64)?KAIGO_RATE_COMP:0;
+                    const baseRate = INS_RATE.health+INS_RATE.pension+INS_RATE.employ+kaigo2;
+                    const apr = Math.round(hyojun*baseRate);
+                    const may = Math.round(hyojun*(baseRate+KOSODATE_RATE));
+                    return <>試算：{fmtY(apr)}／月（4月）　{fmtY(may)}／月（5月〜）</>;
+                  })()}
+                </div>}
+              </div>
+              <MGrid2><MField label="社会保険（月・手動）※加入時のみ入力・空欄で0円"><MInputN val={D.insOverride??""} set={v=>patchModal("insOverride",v===""||v===0?null:v)}/></MField></MGrid2></>
+            ):(
+              <><div style={{background:"#f0f9ff",border:"1px solid #bae6fd",borderRadius:8,padding:"8px 14px",fontSize:11,color:"#0369a1",marginBottom:10}}>
+                <div style={{marginBottom:3}}>自動試算（愛知県協会けんぽ2026年度）</div>
+                <div style={{lineHeight:1.8}}>
+                  健保 {(INS_RATE.health*100).toFixed(3)}%　厚生年金 {(INS_RATE.pension*100).toFixed(2)}%　雇用保険 {(INS_RATE.employ*100).toFixed(2)}%
+                  {(D.age>=40&&D.age<=64)&&<span>　介護 {(KAIGO_RATE_COMP*100).toFixed(3)}%</span>}
+                  　子育て支援金 {(KOSODATE_RATE*100).toFixed(3)}%（5月〜・会社負担のみ）
+                </div>
+                {D.monthlyBase>0&&<div style={{marginTop:4,fontWeight:700}}>
+                  {(()=>{
+                    const gross = calcMonthlyGross(D,"4月")||calcMonthlyGross({...D,workStartMonth:"4月",workEndMonth:"3月"},"4月");
+                    const hyojun = getHyojun(D.empType==="EXEC"?D.monthlyBase:gross);
+                    const kaigo2 = (D.age>=40&&D.age<=64)?KAIGO_RATE_COMP:0;
+                    const baseRate = D.empType==="EXEC"
+                      ? INS_RATE.health+INS_RATE.pension+kaigo2
+                      : INS_RATE.health+INS_RATE.pension+INS_RATE.employ+kaigo2;
+                    const apr = Math.round(hyojun*baseRate);
+                    const may = Math.round(hyojun*(baseRate+KOSODATE_RATE));
+                    return <>試算：{fmtY(apr)}／月（4月）　{fmtY(may)}／月（5月〜）</>;
+                  })()}
+                </div>}
+              </div>
+              <MGrid2><MField label="手動上書き（空欄で自動） ※会社・本人とも同額適用"><MInputN val={D.insOverride??""} set={v=>patchModal("insOverride",v===""||v===0?null:v)}/></MField></MGrid2></>
+            )}
+
+            <MSect>賞与</MSect>
+            {isPart?<div style={{fontSize:11,color:CS.mute,marginBottom:14}}>アルバイトは賞与なし</div>:(
+              <>
+                <div style={{background:"#f8fafc",border:`1px solid ${CS.border}`,borderRadius:10,padding:"12px 14px",marginBottom:12}}>
+                  <label style={{display:"flex",alignItems:"center",gap:7,cursor:"pointer",fontSize:12,fontWeight:700,userSelect:"none",marginBottom:8}}>
+                    <input type="checkbox" checked={D.bonus9Enable} onChange={e=>patchModal("bonus9Enable",e.target.checked)} style={{accentColor:CS.blue,width:14,height:14}}/>
+                    9月賞与
+                  </label>
+                  {D.bonus9Enable&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                    {(isExec||D.empType==="FULL")&&<MField label="勤務月数（0〜6）" hint={D.bonus9Amount!=null?"上書き中は無効":"デフォルト6"}>
+                      <MInputN val={D.bonus9Months??6} set={v=>patchModal("bonus9Months",Math.min(6,Math.max(0,Number(v))))} suffix="ヶ月" max={6}
+                        style={{opacity:D.bonus9Amount!=null?0.4:1}}/>
+                    </MField>}
+                    <MField label="金額を直接入力（空欄で自動）" hint={D.empType==="CONTRACT"?"寸志など":"月数計算を上書き"}>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        <MInputN val={D.bonus9Amount??""} set={v=>patchModal("bonus9Amount",v===""?null:Number(v))} prefix="¥"/>
+                        {D.bonus9Amount!=null&&<button type="button" onClick={()=>patchModal("bonus9Amount",null)}
+                          style={{fontSize:10,color:"#dc2626",background:"transparent",border:"1px solid #fecaca",borderRadius:5,padding:"3px 7px",cursor:"pointer",whiteSpace:"nowrap"}}>クリア</button>}
+                      </div>
+                      {D.bonus9Amount!=null&&<div style={{fontSize:10,color:"#d97706",marginTop:2}}>⚠ 手動上書き中</div>}
+                    </MField>
+                    {D.monthlyBase>0&&<MField label="支給額（試算）">
+                      <div style={{padding:"8px 12px",background:"#faf5ff",border:"1px solid #e9d5ff",borderRadius:8,fontSize:13,color:CS.purple,fontWeight:700}}>
+                        {fmtY(calcBonus(D,"9月"))}
+                        {D.bonus9Amount==null&&!isExec&&<span style={{fontSize:10,color:CS.mute,marginLeft:4}}>({D.bonus9Months??6}ヶ月分)</span>}
+                      </div>
+                    </MField>}
+                    {D.monthlyBase>0&&<MField label="賞与社保（空欄で自動）" hint="会社負担">
+                      <MInputN val={D.bonus9InsOverride??""} prefix="¥" set={v=>patchModal("bonus9InsOverride",v===""?null:Number(v))}/>
+                      <div style={{fontSize:10,color:CS.mute,marginTop:3}}>自動試算：{fmtY(calcBonusInsMonth({...D,bonus9InsOverride:null,bonus3InsOverride:null},"9月"))}</div>
+                    </MField>}
+                  </div>}
+                </div>
+                <div style={{background:"#f8fafc",border:`1px solid ${CS.border}`,borderRadius:10,padding:"12px 14px",marginBottom:12}}>
+                  <label style={{display:"flex",alignItems:"center",gap:7,cursor:"pointer",fontSize:12,fontWeight:700,userSelect:"none",marginBottom:8}}>
+                    <input type="checkbox" checked={D.bonus3Enable} onChange={e=>patchModal("bonus3Enable",e.target.checked)} style={{accentColor:CS.blue,width:14,height:14}}/>
+                    3月賞与
+                  </label>
+                  {D.bonus3Enable&&<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                    {(isExec||D.empType==="FULL")&&<MField label="勤務月数（0〜6）" hint={D.bonus3Amount!=null?"上書き中は無効":"デフォルト6"}>
+                      <MInputN val={D.bonus3Months??6} set={v=>patchModal("bonus3Months",Math.min(6,Math.max(0,Number(v))))} suffix="ヶ月" max={6}
+                        style={{opacity:D.bonus3Amount!=null?0.4:1}}/>
+                    </MField>}
+                    <MField label="金額を直接入力（空欄で自動）" hint={D.empType==="CONTRACT"?"寸志など":"月数計算を上書き"}>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        <MInputN val={D.bonus3Amount??""} set={v=>patchModal("bonus3Amount",v===""?null:Number(v))} prefix="¥"/>
+                        {D.bonus3Amount!=null&&<button type="button" onClick={()=>patchModal("bonus3Amount",null)}
+                          style={{fontSize:10,color:"#dc2626",background:"transparent",border:"1px solid #fecaca",borderRadius:5,padding:"3px 7px",cursor:"pointer",whiteSpace:"nowrap"}}>クリア</button>}
+                      </div>
+                      {D.bonus3Amount!=null&&<div style={{fontSize:10,color:"#d97706",marginTop:2}}>⚠ 手動上書き中</div>}
+                    </MField>
+                    {D.monthlyBase>0&&<MField label="支給額（試算）">
+                      <div style={{padding:"8px 12px",background:"#faf5ff",border:"1px solid #e9d5ff",borderRadius:8,fontSize:13,color:CS.purple,fontWeight:700}}>
+                        {fmtY(calcBonus(D,"3月"))}
+                        {D.bonus3Amount==null&&!isExec&&<span style={{fontSize:10,color:CS.mute,marginLeft:4}}>({D.bonus3Months??6}ヶ月分)</span>}
+                      </div>
+                    </MField>}
+                    {D.monthlyBase>0&&<MField label="賞与社保（空欄で自動）" hint="会社負担">
+                      <MInputN val={D.bonus3InsOverride??""} prefix="¥" set={v=>patchModal("bonus3InsOverride",v===""?null:Number(v))}/>
+                      <div style={{fontSize:10,color:CS.mute,marginTop:3}}>自動試算：{fmtY(calcBonusInsMonth({...D,bonus9InsOverride:null,bonus3InsOverride:null},"3月"))}</div>
+                    </MField>}
+                  </div>}
+                </div>
+              </>
+            )}
+
+            <MSect>所得税・住民税</MSect>
+            {(() => {
+              // 年収・課税所得の試算
+              const nenShu      = MONTHS.reduce((s,m)=>s+calcMonthlyGross(D,m),0)
+                                + BONUS_MONTHS.reduce((s,m)=>s+calcBonus(D,m),0);
+              const kyuyoKojo   = calcKyuyoKojo(nenShu);
+              const kisoKojo    = 480000; // 基礎控除（2020年改正後）
+              const shakaiFutan = MONTHS.reduce((s,m)=>s+calcEmpInsMonth(D,m),0);
+              const kazeiShotoku= Math.max(nenShu - kyuyoKojo - kisoKojo - shakaiFutan, 0);
+              return (
+                <div style={{background:"#f0f9ff",border:"1px solid #bae6fd",borderRadius:8,
+                  padding:"12px 16px",marginBottom:14,fontSize:11}}>
+                  <div style={{fontWeight:700,color:"#0369a1",marginBottom:8}}>📊 課税ベース試算（手入力の参考に）</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"6px 20px",color:CS.text}}>
+                    <div style={{display:"flex",justifyContent:"space-between"}}>
+                      <span style={{color:CS.sub}}>年収（基本給＋残業＋諸手当＋賞与）</span>
+                      <b>{fmtM(nenShu)}</b>
+                    </div>
+                    <div style={{display:"flex",justifyContent:"space-between"}}>
+                      <span style={{color:CS.sub}}>給与所得控除</span>
+                      <span style={{color:"#059669"}}>▲{fmtM(kyuyoKojo)}</span>
+                    </div>
+                    <div style={{display:"flex",justifyContent:"space-between"}}>
+                      <span style={{color:CS.sub}}>社会保険料控除</span>
+                      <span style={{color:"#059669"}}>▲{fmtM(shakaiFutan)}</span>
+                    </div>
+                    <div style={{display:"flex",justifyContent:"space-between"}}>
+                      <span style={{color:CS.sub}}>基礎控除</span>
+                      <span style={{color:"#059669"}}>▲{fmtM(kisoKojo)}</span>
+                    </div>
+                    <div style={{display:"flex",justifyContent:"space-between",gridColumn:"1/-1",
+                      borderTop:`1px solid #bae6fd`,paddingTop:6,marginTop:2}}>
+                      <span style={{color:"#0369a1",fontWeight:700}}>課税所得（概算）</span>
+                      <b style={{color:"#0369a1",fontSize:13}}>{fmtM(kazeiShotoku)}</b>
+                    </div>
+                  </div>
+                  <div style={{fontSize:10,color:CS.mute,marginTop:6}}>
+                    ※扶養控除・生命保険料控除等は含まず。実際の税額とは異なる場合があります。
+                  </div>
+                </div>
+              );
+            })()}
+            {true && <><MGrid2>
+                  <MField label="所得税（月額）" hint="空欄で自動計算">
+                    <MInputN
+                      val={D.incomeTaxOverride??""} prefix="¥"
+                      set={v=>patchModal("incomeTaxOverride", v===""||v===0 ? null : Number(v))}
+                    />
+                    <div style={{fontSize:10,color:CS.mute,marginTop:3}}>
+                      自動試算：{fmtY(calcIncomeTaxMonth({...D,incomeTaxOverride:null}, firstModalMonth))}
+                    </div>
+                  </MField>
+                  <MField label="住民税（月額）" hint="空欄で自動計算">
+                    <MInputN
+                      val={D.residentTaxOverride??""} prefix="¥"
+                      set={v=>patchModal("residentTaxOverride", v===""||v===0 ? null : Number(v))}
+                    />
+                    <div style={{fontSize:10,color:CS.mute,marginTop:3}}>
+                      自動試算：{fmtY(calcResidentTaxMonth({...D,residentTaxOverride:null}))}
+                    </div>
+                  </MField>
+                </MGrid2>
+                {(D.incomeTaxOverride!==null||D.residentTaxOverride!==null)&&(
+                  <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,padding:"8px 14px",fontSize:11,color:"#92400e",marginBottom:14}}>
+                    ✏️ 手動上書き中 — 実績値を反映しています
+                  </div>
+                )}
+                {isPart&&(
+                  <div style={{fontSize:10,color:CS.mute,marginBottom:8}}>
+                    ※ アルバイトは月収88,000円未満なら所得税0円。住民税は前年所得ベースのため実態に合わせて手動入力を推奨。
+                  </div>
+                )}
+              </>}
+
+            <MSect>その他</MSect>
+            <MGrid2>
+              <MField label="年齢（4/1時点）" hint="40-64歳は介護保険加算">
+                <MInputN val={D.age??30} set={v=>patchModal("age",Number(v))} suffix="歳"/>
+              </MField>
+              <MField label="">
+                {D.age>=40&&D.age<=64&&<div style={{background:"#fef3c7",border:"1px solid #fde68a",borderRadius:8,padding:"6px 12px",fontSize:11,color:"#92400e"}}>🏥 介護保険料対象（40〜64歳）</div>}
+              </MField>
+              <MField label="勤務開始月" hint="最初に給与が発生する月">
+                <select style={{...iStyle,cursor:"pointer"}} value={D.workStartMonth??"4月"} onChange={e=>patchModal("workStartMonth",e.target.value)}>
+                  {MONTHS.map(m=><option key={m} value={m}>{m}</option>)}
+                </select>
+              </MField>
+              <MField label="勤務最終月" hint="最後に給与が発生する月">
+                <select style={{...iStyle,cursor:"pointer"}} value={D.workEndMonth??"3月"} onChange={e=>patchModal("workEndMonth",e.target.value)}>
+                  {MONTHS.map(m=><option key={m} value={m}>{m}</option>)}
+                </select>
+              </MField>
+            </MGrid2>
+            <MField label="備考"><MInput val={D.note} set={v=>patchModal("note",v)}/></MField>
+
+            {D.name&&(
+              <div style={{background:"#f8fafc",border:`1px solid ${CS.border}`,borderRadius:10,padding:14,marginTop:16}}>
+                <div style={{fontSize:11,color:CS.sub,marginBottom:8,fontWeight:600}}>💡 コスト試算プレビュー</div>
+                <div style={{display:"flex",gap:20,flexWrap:"wrap"}}>
+                  {["4月","9月","3月"].map(m=>(
+                    <div key={m}><div style={{fontSize:10,color:CS.mute}}>{m}</div>
+                      <div style={{fontSize:15,fontWeight:700,color:BONUS_MONTHS.includes(m)?CS.purple:CS.blue}}>{fmtM(calcMonthlyTotal(D,m))}</div>
+                    </div>
+                  ))}
+                  <div><div style={{fontSize:10,color:CS.mute}}>年間合計</div>
+                    <div style={{fontSize:15,fontWeight:700,color:CS.green}}>{fmtM(calcAnnualTotal(D))}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div style={{display:"flex",gap:10,marginTop:20}}>
+              <button onClick={saveModal} style={{flex:1,background:CS.blue,color:"#fff",border:"none",padding:"11px",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:700,boxShadow:"0 2px 8px rgba(37,99,235,.3)"}}>
+                {modal.mode==="add"?"追加する":"保存する"}
+              </button>
+              <button onClick={()=>setModal(null)} style={{flex:1,background:"transparent",color:CS.sub,border:`1px solid ${CS.border}`,padding:"11px",borderRadius:9,cursor:"pointer",fontSize:13}}>キャンセル</button>
+            </div>
+            {modal.mode==="edit" && (
+              <button onClick={()=>deleteStaff(D.id, D.name)}
+                style={{width:"100%",marginTop:8,background:"transparent",color:"#dc2626",
+                  border:"1px solid #fecaca",padding:"9px",borderRadius:9,
+                  cursor:"pointer",fontSize:12,fontWeight:600}}>
+                🗑 このスタッフを削除する
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+        {/* ══ バックアップテキストモーダル ══ */}
+      {backupText && (
+        <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,.6)",display:"flex",
+          alignItems:"center",justifyContent:"center",zIndex:5000,padding:16}}>
+          <div style={{background:CS.surface,border:`1px solid ${CS.border}`,borderRadius:16,
+            padding:24,width:"100%",maxWidth:600,boxShadow:"0 20px 60px rgba(0,0,0,.3)"}}>
+            <h3 style={{margin:"0 0 8px",fontSize:15,fontWeight:700}}>📋 バックアップデータ</h3>
+            <p style={{fontSize:11,color:CS.mute,margin:"0 0 12px"}}>
+              以下のテキストを全選択してコピーし、メモ帳等に貼り付けて保存してください。
+            </p>
+            <textarea
+              readOnly
+              value={backupText}
+              onFocus={e=>e.target.select()}
+              style={{width:"100%",height:200,fontSize:10,fontFamily:"monospace",
+                padding:10,borderRadius:8,border:`1px solid ${CS.border}`,
+                background:"#f8fafc",resize:"none",boxSizing:"border-box"}}
+            />
+            <div style={{display:"flex",gap:10,marginTop:12}}>
+              <button onClick={async()=>{
+                try { await navigator.clipboard.writeText(backupText); showNotif("✅ コピーしました"); }
+                catch(e) {}
+              }} style={{flex:1,background:CS.blue,color:"#fff",border:"none",borderRadius:8,
+                padding:"10px",fontSize:13,fontWeight:700,cursor:"pointer"}}>
+                📋 クリップボードにコピー
+              </button>
+              <button onClick={()=>setBackupText(null)}
+                style={{flex:1,background:"transparent",color:CS.sub,
+                  border:`1px solid ${CS.border}`,borderRadius:8,padding:"10px",
+                  fontSize:13,cursor:"pointer"}}>閉じる</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══ CSV表示モーダル ══ */}
+      {csvModal && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}}
+          onClick={()=>setCsvModal(null)}>
+          <div style={{background:"#fff",borderRadius:12,padding:24,width:"min(90vw,700px)",maxHeight:"80vh",display:"flex",flexDirection:"column",gap:12}}
+            onClick={e=>e.stopPropagation()}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <h3 style={{margin:0,fontSize:15,fontWeight:700}}>📋 CSV データ</h3>
+              <button onClick={()=>setCsvModal(null)} style={{background:"none",border:"none",fontSize:18,cursor:"pointer",color:"#64748b"}}>✕</button>
+            </div>
+            <div style={{fontSize:11,color:"#64748b"}}>以下のテキストを全選択してコピーし、Excelや Numbers に貼り付けてください。</div>
+            <textarea
+              readOnly
+              value={csvModal}
+              style={{flex:1,minHeight:260,fontFamily:"monospace",fontSize:11,padding:10,
+                border:"1px solid #e2e8f0",borderRadius:6,resize:"vertical",background:"#f8fafc"}}
+              onFocus={e=>e.target.select()}
+            />
+            <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+              <button onClick={()=>{
+                navigator.clipboard.writeText(csvModal).then(()=>showNotif("✅ クリップボードにコピーしました")).catch(()=>showNotif("❌ コピーに失敗しました","err"));
+              }} style={{padding:"7px 18px",borderRadius:6,background:"#1e293b",color:"#fff",border:"none",cursor:"pointer",fontWeight:700,fontSize:12}}>
+                📋 クリップボードにコピー
+              </button>
+              <button onClick={()=>setCsvModal(null)} style={{padding:"7px 18px",borderRadius:6,background:"#f1f5f9",color:"#374151",border:"1px solid #e2e8f0",cursor:"pointer",fontSize:12}}>
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══ 復元テキスト貼り付けモーダル ══ */}
+      {restoreText !== null && (
+        <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,.6)",display:"flex",
+          alignItems:"center",justifyContent:"center",zIndex:5000,padding:16}}>
+          <div style={{background:CS.surface,border:`1px solid ${CS.border}`,borderRadius:16,
+            padding:24,width:"100%",maxWidth:600,boxShadow:"0 20px 60px rgba(0,0,0,.3)"}}>
+            <h3 style={{margin:"0 0 8px",fontSize:15,fontWeight:700}}>⬆️ データ復元</h3>
+            <p style={{fontSize:11,color:CS.mute,margin:"0 0 12px"}}>
+              バックアップ時にコピーしたJSONテキストをそのまま貼り付けてください。
+            </p>
+            <textarea
+              value={restoreText}
+              onChange={e=>setRestoreText(e.target.value)}
+              placeholder='{"version":1,"exportedAt":...  のテキストを貼り付け'
+              style={{width:"100%",height:200,fontSize:10,fontFamily:"monospace",
+                padding:10,borderRadius:8,border:`1px solid ${CS.border}`,
+                background:"#f8fafc",resize:"none",boxSizing:"border-box"}}
+            />
+            <div style={{display:"flex",gap:10,marginTop:12}}>
+              <button onClick={()=>importFromText(restoreText)}
+                disabled={!restoreText.trim()}
+                style={{flex:1,background:restoreText.trim()?CS.blue:"#94a3b8",color:"#fff",
+                  border:"none",borderRadius:8,padding:"10px",fontSize:13,fontWeight:700,
+                  cursor:restoreText.trim()?"pointer":"not-allowed"}}>
+                復元する
+              </button>
+              <button onClick={()=>setRestoreText(null)}
+                style={{flex:1,background:"transparent",color:CS.sub,
+                  border:`1px solid ${CS.border}`,borderRadius:8,padding:"10px",
+                  fontSize:13,cursor:"pointer"}}>キャンセル</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══ 削除確認ダイアログ ══ */}
+        {confirmDel && (
+          <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:4000,
+            display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+            <div style={{background:"#fff",borderRadius:14,padding:28,width:360,
+              boxShadow:"0 8px 40px rgba(0,0,0,.25)",textAlign:"center"}}>
+              <div style={{fontSize:28,marginBottom:12}}>🗑</div>
+              <div style={{fontSize:15,fontWeight:700,marginBottom:8}}>スタッフを削除しますか？</div>
+              <div style={{fontSize:13,color:"#64748b",marginBottom:24}}>
+                「<b>{confirmDel.name}</b>」を削除します。<br/>この操作は元に戻せません。
+              </div>
+              <div style={{display:"flex",gap:10}}>
+                <button type="button" onClick={()=>setConfirmDel(null)}
+                  style={{flex:1,padding:"11px",borderRadius:9,cursor:"pointer",fontSize:13,
+                    background:"transparent",color:"#64748b",border:"1px solid #e2e8f0",fontWeight:600}}>
+                  キャンセル
+                </button>
+                <button type="button" onClick={confirmDeleteExec}
+                  style={{flex:1,padding:"11px",borderRadius:9,cursor:"pointer",fontSize:13,
+                    background:"#dc2626",color:"#fff",border:"none",fontWeight:700}}>
+                  削除する
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ══ 経費合計 ══ */}
+        {tab==="sougou" && (() => {
+          const hasPrevData = currentPeriod.id === 21;
+          if (!hasPrevData) return (
+            <div style={{...card(), textAlign:"center", padding:"48px 24px"}}>
+              <div style={{fontSize:36, marginBottom:16}}>⚠️</div>
+              <div style={{fontSize:15, fontWeight:700, color:"#dc2626", marginBottom:8}}>
+                前年実績データがありません
+              </div>
+              <div style={{fontSize:12, color:CS.mute, lineHeight:1.8}}>
+                このタブは前年の月別実績データをベースに試算を行います。<br/>
+                <b>{currentPeriod.label}</b> の前年実績はまだ登録されていません。<br/>
+                第21期の試算には対応しています。
+              </div>
+              <div style={{marginTop:20, fontSize:11, color:CS.sub,
+                background:"#f8fafc", border:`1px solid ${CS.border}`,
+                borderRadius:8, padding:"10px 16px", display:"inline-block"}}>
+                💡 期別推移タブで各期の合計を確認できます
+              </div>
+            </div>
+          );
+          const jinkenhi_annual = totalAnnual;
+          const prev_sougou     = 93837645; // 第20期実績（月別合計: 93,837,645円）
+
+          return (
+          <div style={{display:"flex",flexDirection:"column",gap:20}}>
+
+            {/* ベア適用中バナー */}
+            {showBear && (
+              <div style={{background:"#fef3c7",border:"1px solid #f59e0b",borderRadius:10,
+                padding:"10px 16px",display:"flex",alignItems:"center",gap:10,fontSize:12}}>
+                <span style={{fontSize:16}}>📈</span>
+                <span style={{fontWeight:700,color:"#92400e"}}>ベアシミュレーション適用中</span>
+                <span style={{color:"#92400e"}}>
+                  人件費増加：{fmtM(bearDiff)}円（{(bearDiff/jinkenhi_annual*100).toFixed(2)}%増）
+                </span>
+              </div>
+            )}
+
+            {/* KPIカード */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12}}>
+              {[
+                {label: showBear?"人件費（ベア後）":"人件費（年間）",
+                  val:fmtM(showBear?bear_jinkenhi_annual:jinkenhi_annual), color:CS.blue,
+                  sub: showBear?`現行 ${fmtM(jinkenhi_annual)} / 増加 +${fmtM(bearDiff)}`:`月平均 ${fmtM(Math.round(jinkenhi_annual/12))}`},
+                {label:"販管費（年間）",   val:fmtM(hankanhi_annual), color:CS.purple, sub:`月平均 ${fmtM(Math.round(hankanhi_annual/12))}`},
+                {label: showBear?"経費合計（ベア後）":"経費合計（年間）",
+                  val:fmtM(showBear?bear_sougou_annual:sougou_annual), color:CS.text,
+                  sub: showBear?`現行 ${fmtM(sougou_annual)}`:`月平均 ${fmtM(Math.round(sougou_annual/12))}`},
+                {label:"前期比",
+                  val:((showBear?bear_sougou_annual:sougou_annual)-prev_sougou>=0?"+":"")+fmtM((showBear?bear_sougou_annual:sougou_annual)-prev_sougou),
+                  color:(showBear?bear_sougou_annual:sougou_annual)>=prev_sougou?"#dc2626":"#059669",
+                  sub:`前期 ${fmtM(prev_sougou)}`},
+              ].map(k=>(
+                <div key={k.label} style={{...card(),padding:"14px 16px"}}>
+                  <div style={{fontSize:10,color:CS.mute,marginBottom:4}}>{k.label}</div>
+                  <div style={{fontSize:18,fontWeight:700,color:k.color}}>{k.val}</div>
+                  <div style={{fontSize:10,color:CS.mute,marginTop:3}}>{k.sub}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* 月別合計表 */}
+            <div style={card()}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+                <STitle style={{margin:0}}>月別経費合計</STitle>
+                <button onClick={()=>{
+                  const PREV={"4月":7735030,"5月":6912696,"6月":7138354,"7月":7604106,"8月":7020866,
+                    "9月":9755843,"10月":7429445,"11月":7223820,"12月":7426367,
+                    "1月":7928578,"2月":7408546,"3月":10253994};
+                  const rows=[
+                    ["項目",...MONTHS,"年間"],
+                    ["人件費",...MONTHS.map(m=>staff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0)),jinkenhi_annual],
+                    ...(showBear?[["人件費（ベア後）",...MONTHS.map(m=>bearStaff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0)),bear_jinkenhi_annual]]:[] ),
+                    ["販管費",...MONTHS.map(m=>calcHankanhiMonth(m)),hankanhi_annual],
+                    ["前期実績",...MONTHS.map(m=>PREV[m]||0),prev_sougou],
+                    ["合計（21期）",...MONTHS.map(m=>calcMonthlyTotal_all(m)),sougou_annual],
+                    ...(showBear?[["合計（ベア後）",...MONTHS.map(m=>bearStaff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0)+calcHankanhiMonth(m)),bear_sougou_annual]]:[] ),
+                  ];
+                  const csv=rows.map(r=>r.map(v=>typeof v==="number"?v:String(v)).join(",")).join("\n");
+                  setCsvModal(csv);
+                }} style={{fontSize:11,fontWeight:700,padding:"5px 14px",borderRadius:6,
+                  background:"#1e293b",color:"#fff",border:"none",cursor:"pointer"}}>
+                  📋 CSV表示
+                </button>
+              </div>
+              <div style={{overflowX:"auto"}}>
+                <table style={{borderCollapse:"collapse",fontSize:12,width:"100%",minWidth:960}}>
+                  <thead>
+                    <tr>
+                      {["項目","4月","5月","6月","7月","8月","9月","10月","11月","12月","1月","2月","3月","年間"].map(h=>(
+                        <th key={h} style={{padding:"8px 10px",textAlign:h==="項目"?"left":"right",
+                          borderBottom:`2px solid ${CS.border}`,fontSize:11,color:CS.sub,fontWeight:700,
+                          background:"#f8fafc",whiteSpace:"nowrap"}}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[
+                      {label:"人件費",   color:CS.blue,   fn:m=>staff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0), annual:jinkenhi_annual},
+                      ...(showBear?[{label:"人件費（ベア後）", color:"#f59e0b", fn:m=>bearStaff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0), annual:bear_jinkenhi_annual}]:[]),
+                      {label:"販管費",   color:CS.purple, fn:m=>calcHankanhiMonth(m),                            annual:hankanhi_annual},
+                    ].map(row=>(
+                      <tr key={row.label} style={{borderBottom:`1px solid ${CS.border}`}}>
+                        <td style={{padding:"10px 10px",fontWeight:700,color:row.color,whiteSpace:"nowrap"}}>{row.label}</td>
+                        {MONTHS.map(m=>(
+                          <td key={m} style={{padding:"10px 10px",textAlign:"right",color:CS.text}}>{fmtM(row.fn(m))}</td>
+                        ))}
+                        <td style={{padding:"10px 10px",textAlign:"right",fontWeight:700,color:row.color}}>{fmtM(row.annual)}</td>
+                      </tr>
+                    ))}
+                    {/* 前期実績行 */}
+                    <tr style={{background:"#f8fafc",borderBottom:`1px solid ${CS.border}`}}>
+                      <td style={{padding:"10px 10px",fontWeight:600,color:CS.mute,whiteSpace:"nowrap"}}>前期実績</td>
+                      {MONTHS.map(m=>{
+                        const v = ({"4月":7735030,"5月":6912696,"6月":7138354,"7月":7604106,"8月":7020866,
+                          "9月":9755843,"10月":7429445,"11月":7223820,"12月":7426367,
+                          "1月":7928578,"2月":7408546,"3月":10253994})[m]||0;
+                        return <td key={m} style={{padding:"10px 10px",textAlign:"right",color:CS.mute}}>{fmtM(v)}</td>;
+                      })}
+                      <td style={{padding:"10px 10px",textAlign:"right",fontWeight:600,color:CS.mute}}>{fmtM(prev_sougou)}</td>
+                    </tr>
+                    {/* 合計行 */}
+                    <tr style={{background:"#1e293b"}}>
+                      <td style={{padding:"10px 10px",fontWeight:700,color:"#fff",whiteSpace:"nowrap"}}>合計（21期）</td>
+                      {MONTHS.map(m=>{
+                        const v = calcMonthlyTotal_all(m);
+                        const prev = ({"4月":7735030,"5月":6912696,"6月":7138354,"7月":7604106,"8月":7020866,
+                          "9月":9755843,"10月":7429445,"11月":7223820,"12月":7426367,
+                          "1月":7928578,"2月":7408546,"3月":10253994})[m]||0;
+                        return (
+                          <td key={m} style={{padding:"10px 10px",textAlign:"right"}}>
+                            <div style={{fontWeight:700,color:"#60a5fa"}}>{fmtM(v)}</div>
+                            <div style={{fontSize:9,color:v>=prev?"#fca5a5":"#86efac"}}>
+                              {v>=prev?"+":""}{fmtM(v-prev)}
+                            </div>
+                          </td>
+                        );
+                      })}
+                      <td style={{padding:"10px 10px",textAlign:"right"}}>
+                        <div style={{fontWeight:700,color:"#60a5fa"}}>{fmtM(sougou_annual)}</div>
+                        <div style={{fontSize:10,color:sougou_annual>=prev_sougou?"#fca5a5":"#86efac"}}>
+                          {sougou_annual>=prev_sougou?"+":""}{fmtM(sougou_annual-prev_sougou)}
+                        </div>
+                      </td>
+                    </tr>
+                    {/* ベア後合計行 */}
+                    {showBear && (
+                      <tr style={{background:"#78350f"}}>
+                        <td style={{padding:"10px 10px",fontWeight:700,color:"#fef3c7",whiteSpace:"nowrap"}}>合計（ベア後）</td>
+                        {MONTHS.map(m=>{
+                          const v = bearStaff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0)+calcHankanhiMonth(m);
+                          const cur = calcMonthlyTotal_all(m);
+                          return (
+                            <td key={m} style={{padding:"10px 10px",textAlign:"right"}}>
+                              <div style={{fontWeight:700,color:"#fcd34d"}}>{fmtM(v)}</div>
+                              <div style={{fontSize:9,color:"#fde68a"}}>+{fmtM(v-cur)}</div>
+                            </td>
+                          );
+                        })}
+                        <td style={{padding:"10px 10px",textAlign:"right"}}>
+                          <div style={{fontWeight:700,color:"#fcd34d"}}>{fmtM(bear_sougou_annual)}</div>
+                          <div style={{fontSize:10,color:"#fde68a"}}>+{fmtM(bear_sougou_annual-sougou_annual)}</div>
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* 月別積み上げバーチャート */}
+            <div style={card()}>
+              <STitle>月別内訳グラフ（人件費 vs 販管費）</STitle>
+              <div style={{display:"flex",gap:12,fontSize:10,color:CS.sub,marginBottom:12}}>
+                <span><span style={{display:"inline-block",width:10,height:10,background:CS.blue,borderRadius:2,marginRight:4}}/>人件費</span>
+                <span><span style={{display:"inline-block",width:10,height:10,background:CS.purple,borderRadius:2,marginRight:4}}/>販管費</span>
+                <span><span style={{display:"inline-block",width:10,height:10,background:"#e2e8f0",borderRadius:2,marginRight:4,border:"1px dashed #94a3b8"}}/>前期実績</span>
+              </div>
+              <div style={{display:"flex",alignItems:"flex-end",gap:6,height:200}}>
+                {MONTHS.map(m=>{
+                  const jin = staff.reduce((s,st)=>s+calcMonthlyTotal(st,m),0);
+                  const han = calcHankanhiMonth(m);
+                  const tot = jin+han;
+                  const prev20 = ({"4月":7735030,"5月":6912696,"6月":7138354,"7月":7604106,"8月":7020866,
+                    "9月":9755843,"10月":7429445,"11月":7223820,"12月":7426367,
+                    "1月":7928578,"2月":7408546,"3月":10253994})[m]||0;
+                  const maxV = Math.max(...MONTHS.map(mx=>{
+                    const j2=staff.reduce((s,st)=>s+calcMonthlyTotal(st,mx),0);
+                    return j2+calcHankanhiMonth(mx);
+                  }),prev_sougou/12*1.5,1);
+                  const scale=170/maxV;
+                  const hJin=Math.max(jin*scale,2);
+                  const hHan=Math.max(han*scale,2);
+                  const hPrev=prev20*scale;
+                  const isBonus=BONUS_MONTHS.includes(m);
+                  return (
+                    <div key={m} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center"}}>
+                      <div style={{fontSize:9,color:CS.sub,marginBottom:2,whiteSpace:"nowrap"}}>{fmtM(tot)}</div>
+                      <div style={{width:"100%",display:"flex",flexDirection:"column",alignItems:"center",position:"relative"}}>
+                        {/* 前期実績ライン */}
+                        <div style={{position:"absolute",bottom:hPrev,left:0,right:0,height:2,
+                          background:"#94a3b8",borderTop:"2px dashed #94a3b8",zIndex:1}}/>
+                        <div style={{width:"75%",height:hHan,background:CS.purple,borderRadius:"3px 3px 0 0"}}/>
+                        <div style={{width:"75%",height:hJin,background:CS.blue}}/>
+                      </div>
+                      <div style={{fontSize:9,marginTop:4,textAlign:"center",color:isBonus?CS.purple:CS.sub,fontWeight:600}}>
+                        {m}{isBonus&&<div style={{fontSize:8}}>賞与月</div>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+          );
+        })()}
+
+        {/* ══ 販管費 ══ */}
+        {tab==="hankanhi" && (() => {
+          // 前年実績チェック（現状はHANKANHI_BASE_20=第20期実績のみ対応）
+          const hasPrevData = currentPeriod.id === 21;
+          if (!hasPrevData) return (
+            <div style={{...card(), textAlign:"center", padding:"48px 24px"}}>
+              <div style={{fontSize:36, marginBottom:16}}>⚠️</div>
+              <div style={{fontSize:15, fontWeight:700, color:"#dc2626", marginBottom:8}}>
+                前年実績データがありません
+              </div>
+              <div style={{fontSize:12, color:CS.mute, lineHeight:1.8}}>
+                このタブは前年の月別実績データをベースに試算を行います。<br/>
+                <b>{currentPeriod.label}</b> の前年実績はまだ登録されていません。<br/>
+                第21期の試算には対応しています。
+              </div>
+              <div style={{marginTop:20, fontSize:11, color:CS.sub,
+                background:"#f8fafc", border:`1px solid ${CS.border}`,
+                borderRadius:8, padding:"10px 16px", display:"inline-block"}}>
+                💡 期別推移タブで各期の合計を確認できます
+              </div>
+            </div>
+          );
+          const CAT_COLORS = {
+            "家賃・地代":"#2563eb","広告宣伝費":"#7c3aed","システム・SaaS":"#0891b2",
+            "交際費・交通費":"#059669","外注・外注加工費":"#d97706","その他一時費用":"#dc2626",
+          };
+          const catColor = (cat) => CAT_COLORS[cat] || "#64748b";
+          const annualBase  = Object.values(HANKANHI_BASE_20).reduce((a,b)=>a+b,0);
+          const annualDelta = MONTHS.reduce((s,m)=>s+calcHankanhiDelta(m),0);
+          const annualTotal = annualBase + annualDelta;
+
+          return (
+          <div style={{display:"flex",flexDirection:"column",gap:20}}>
+
+            {/* ── KPIカード ── */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12}}>
+              {[
+                {label:"前年実績（年間）",  val:fmtM(annualBase),  color:CS.sub},
+                {label:"増減合計（年間）",  val:(annualDelta>=0?"+":"")+fmtM(annualDelta), color:annualDelta>=0?"#dc2626":"#059669"},
+                {label:"21期試算（年間）",  val:fmtM(annualTotal), color:CS.blue},
+                {label:"月平均",           val:fmtM(Math.round(annualTotal/12)), color:CS.text},
+              ].map(k=>(
+                <div key={k.label} style={{...card(),textAlign:"center",padding:"14px 16px"}}>
+                  <div style={{fontSize:10,color:CS.mute,marginBottom:4}}>{k.label}</div>
+                  <div style={{fontSize:18,fontWeight:700,color:k.color}}>{k.val}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* ── 月別サマリー ── */}
+            <div style={card()}>
+              <STitle>月別販管費サマリー</STitle>
+              <div style={{overflowX:"auto"}}>
+                <table style={{borderCollapse:"collapse",fontSize:12,width:"100%",minWidth:900}}>
+                  <thead>
+                    <tr>
+                      {["項目","4月","5月","6月","7月","8月","9月","10月","11月","12月","1月","2月","3月","年間合計"].map(h=>(
+                        <th key={h} style={{padding:"8px 10px",textAlign:h==="項目"?"left":"right",
+                          borderBottom:`2px solid ${CS.border}`,fontSize:11,color:CS.sub,
+                          fontWeight:700,background:"#f8fafc",whiteSpace:"nowrap"}}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr style={{background:"#f8fafc"}}>
+                      <td style={{padding:"8px 10px",fontWeight:600,color:CS.sub,whiteSpace:"nowrap"}}>前年実績</td>
+                      {MONTHS.map(m=>(
+                        <td key={m} style={{padding:"8px 10px",textAlign:"right",color:CS.sub}}>
+                          {fmtM(HANKANHI_BASE_20[m])}
+                        </td>
+                      ))}
+                      <td style={{padding:"8px 10px",textAlign:"right",fontWeight:700,color:CS.sub}}>{fmtM(annualBase)}</td>
+                    </tr>
+                    <tr style={{background:"#fef9f9"}}>
+                      <td style={{padding:"8px 10px",fontWeight:600,color:"#dc2626",whiteSpace:"nowrap"}}>増減合計</td>
+                      {MONTHS.map(m=>{
+                        const d=calcHankanhiDelta(m);
+                        return (
+                          <td key={m} style={{padding:"8px 10px",textAlign:"right",
+                            fontWeight:d!==0?700:400,
+                            color:d>0?"#dc2626":d<0?"#059669":CS.mute}}>
+                            {d===0?"—":(d>0?"+":"")+fmtM(d)}
+                          </td>
+                        );
+                      })}
+                      <td style={{padding:"8px 10px",textAlign:"right",fontWeight:700,
+                        color:annualDelta>0?"#dc2626":annualDelta<0?"#059669":CS.mute}}>
+                        {annualDelta===0?"—":(annualDelta>0?"+":"")+fmtM(annualDelta)}
+                      </td>
+                    </tr>
+                    <tr style={{background:"#eff6ff"}}>
+                      <td style={{padding:"8px 10px",fontWeight:700,color:CS.blue,whiteSpace:"nowrap"}}>21期試算</td>
+                      {MONTHS.map(m=>(
+                        <td key={m} style={{padding:"8px 10px",textAlign:"right",fontWeight:700,color:CS.blue}}>
+                          {fmtM(calcHankanhiMonth(m))}
+                        </td>
+                      ))}
+                      <td style={{padding:"8px 10px",textAlign:"right",fontWeight:700,color:CS.blue}}>{fmtM(annualTotal)}</td>
+                    </tr>
+
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* ── 増減項目リスト ── */}
+            <div style={card()}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+                <STitle>増減項目</STitle>
+                <button onClick={()=>setHankanhiModal({mode:"add",data:emptyHankanhi()})}
+                  style={{background:CS.blue,color:"#fff",border:"none",padding:"9px 20px",
+                    borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:700}}>
+                  ＋ 項目を追加
+                </button>
+              </div>
+              {hankanhiItems.length===0 ? (
+                <div style={{textAlign:"center",padding:"32px 0",color:CS.mute,fontSize:13}}>
+                  <div style={{fontSize:28,marginBottom:8}}>📋</div>
+                  増減項目がありません。「＋ 項目を追加」から登録してください。
+                </div>
+              ) : (
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  {hankanhiItems.map((item,idx)=>{
+                    const annualEffect = item.applyType==="monthly"
+                      ? MONTHS.filter(m=>{
+                          const si=MONTH_IDX[item.startMonth??"4月"],ei=MONTH_IDX[item.endMonth??"3月"],mi=MONTH_IDX[m];
+                          return si<=ei?mi>=si&&mi<=ei:mi>=si||mi<=ei;
+                        }).length * (item.amount||0)
+                      : item.applyType==="custom"
+                        ? MONTHS.reduce((s,m)=>s+resolveCustomAmount(item.monthlyAmounts)[m],0)
+                        : (item.specificMonths||[]).length * (item.amount||0);
+                    return (
+                      <div key={item.id} style={{
+                        display:"flex",alignItems:"center",gap:12,padding:"12px 16px",
+                        background:CS.surface,border:`1px solid ${CS.border}`,borderRadius:10,
+                        borderLeft:`4px solid ${catColor(item.category)}`
+                      }}>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+                            <span style={{fontWeight:700,fontSize:13}}>{item.name||"（名称未設定）"}</span>
+                            {item.category&&<Chip col={catColor(item.category)} bg={catColor(item.category)+"18"} border={catColor(item.category)+"44"}>{item.category}</Chip>}
+                            <Chip
+                              col={item.applyType==="monthly"?"#0891b2":item.applyType==="custom"?"#d97706":"#7c3aed"}
+                              bg={item.applyType==="monthly"?"#e0f2fe":item.applyType==="custom"?"#fef3c7":"#f3e8ff"}
+                              border={item.applyType==="monthly"?"#bae6fd":item.applyType==="custom"?"#fde68a":"#e9d5ff"}>
+                              {item.applyType==="monthly"
+                                ?`毎月 ${item.startMonth}〜${item.endMonth}`
+                                :item.applyType==="custom"
+                                  ?"月別入力"
+                                  :`特定月: ${(item.specificMonths||[]).join("・")}`}
+                            </Chip>
+                          </div>
+                          <div style={{fontSize:11,color:CS.mute}}>{item.note||""}</div>
+                        </div>
+                        {(()=>{
+                          const monthAvg = item.applyType==="custom"
+                            ? Math.round(annualEffect/12)
+                            : (item.amount||0);
+                          const isPos = annualEffect>=0;
+                          return (
+                            <div style={{textAlign:"right",flexShrink:0}}>
+                              <div style={{fontSize:15,fontWeight:700,color:isPos?"#dc2626":"#059669"}}>
+                                {isPos?"+":""}{fmtM(annualEffect)}/年
+                              </div>
+                              <div style={{fontSize:10,color:CS.mute}}>
+                                月額: {monthAvg>=0?"+":""}{fmtM(monthAvg)}
+                              </div>
+                            </div>
+                          );
+                        })()}
+                        <div style={{display:"flex",gap:6,flexShrink:0,alignItems:"center"}}>
+                          <div style={{display:"flex",flexDirection:"column",gap:2}}>
+                            <button type="button" disabled={idx===0}
+                              onClick={()=>setHankanhiItems(prev=>{const a=[...prev];[a[idx-1],a[idx]]=[a[idx],a[idx-1]];return a;})}
+                              style={{padding:"2px 7px",fontSize:11,borderRadius:4,cursor:idx===0?"not-allowed":"pointer",
+                                border:`1px solid ${CS.border}`,background:"transparent",
+                                color:idx===0?CS.mute:CS.text,lineHeight:1}}>▲</button>
+                            <button type="button" disabled={idx===hankanhiItems.length-1}
+                              onClick={()=>setHankanhiItems(prev=>{const a=[...prev];[a[idx],a[idx+1]]=[a[idx+1],a[idx]];return a;})}
+                              style={{padding:"2px 7px",fontSize:11,borderRadius:4,cursor:idx===hankanhiItems.length-1?"not-allowed":"pointer",
+                                border:`1px solid ${CS.border}`,background:"transparent",
+                                color:idx===hankanhiItems.length-1?CS.mute:CS.text,lineHeight:1}}>▼</button>
+                          </div>
+                          <button onClick={()=>setHankanhiModal({mode:"edit",data:{...item}})}
+                            style={{background:"transparent",color:CS.blue,border:`1px solid #bfdbfe`,
+                              padding:"6px 12px",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600}}>編集</button>
+                          <button onClick={()=>setHankanhiItems(prev=>prev.filter(x=>x.id!==item.id))}
+                            style={{background:"transparent",color:"#dc2626",border:"1px solid #fecaca",
+                              padding:"6px 12px",borderRadius:7,cursor:"pointer",fontSize:12,fontWeight:600}}>削除</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+          );
+        })()}
+
+        {/* ══ 販管費モーダル ══ */}
+        {hankanhiModal && (() => {
+          const HD = hankanhiModal.data;
+          const patchHD = (k,v) => setHankanhiModal(p=>({...p,data:{...p.data,[k]:v}}));
+          const saveHD = () => {
+            if (!HD.name.trim()) { showNotif("項目名を入力してください","err"); return; }
+            if (hankanhiModal.mode==="add") {
+              setHankanhiItems(prev=>[...prev,{...HD,id:Date.now()}]);
+              showNotif("項目を追加しました");
+            } else {
+              setHankanhiItems(prev=>prev.map(x=>x.id===HD.id?HD:x));
+              showNotif("保存しました");
+            }
+            setHankanhiModal(null);
+          };
+          return (
+            <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:3000,
+              display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+              <div style={{background:"#fff",borderRadius:14,padding:28,width:520,maxHeight:"90vh",
+                overflowY:"auto",boxShadow:"0 8px 40px rgba(0,0,0,.2)"}}>
+                <div style={{fontSize:16,fontWeight:700,marginBottom:20}}>
+                  {hankanhiModal.mode==="add"?"＋ 増減項目を追加":"✏️ 増減項目を編集"}
+                </div>
+                <div style={{display:"flex",flexDirection:"column",gap:14}}>
+                  <MField label="項目名" hint="例：新オフィス家賃差額、Slack有料化 など">
+                    <input value={HD.name} onChange={e=>patchHD("name",e.target.value)}
+                      style={{...iStyle,width:"100%"}} placeholder="項目名を入力"/>
+                  </MField>
+                  <MField label="カテゴリ" hint="自由入力">
+                    <input value={HD.category} onChange={e=>patchHD("category",e.target.value)}
+                      style={{...iStyle,width:"100%"}} placeholder="例：家賃・地代、広告宣伝費"/>
+                  </MField>
+                  {HD.applyType!=="custom" && (
+                    <MField label="金額（月額）" hint="増加は正の数、削減は負の数で入力">
+                      <div style={{display:"flex",alignItems:"center",gap:8}}>
+                        <MInputN val={HD.amount} set={v=>patchHD("amount",v)} prefix="¥"/>
+                        <span style={{fontSize:12,color:HD.amount>=0?"#dc2626":"#059669",fontWeight:700}}>
+                          {HD.amount>=0?"▲ 増加":"▼ 削減"}
+                        </span>
+                      </div>
+                    </MField>
+                  )}
+                  <MField label="適用方法">
+                    <div style={{display:"flex",gap:8}}>
+                      {[{v:"monthly",l:"毎月固定"},{v:"specific",l:"特定月のみ"},{v:"custom",l:"月別入力"}].map(({v,l})=>(
+                        <button key={v} type="button" onClick={()=>patchHD("applyType",v)}
+                          style={{flex:1,padding:"9px",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:700,
+                            border:`2px solid ${HD.applyType===v?CS.blue:CS.border}`,
+                            background:HD.applyType===v?"#eff6ff":"#fff",
+                            color:HD.applyType===v?CS.blue:CS.sub}}>
+                          {l}
+                        </button>
+                      ))}
+                    </div>
+                  </MField>
+                  {HD.applyType==="monthly" ? (
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                      <MField label="開始月">
+                        <select value={HD.startMonth} onChange={e=>patchHD("startMonth",e.target.value)} style={iStyle}>
+                          {MONTHS.map(m=><option key={m} value={m}>{m}</option>)}
+                        </select>
+                      </MField>
+                      <MField label="終了月">
+                        <select value={HD.endMonth} onChange={e=>patchHD("endMonth",e.target.value)} style={iStyle}>
+                          {MONTHS.map(m=><option key={m} value={m}>{m}</option>)}
+                        </select>
+                      </MField>
+                    </div>
+                  ) : HD.applyType==="custom" ? (
+                    <MField label="月別金額入力" hint="空欄は前月と同額を引き継ぎ">
+                      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+                        {MONTHS.map((m,i)=>{
+                          const val = HD.monthlyAmounts?.[m];
+                          // 表示用：空欄なら前月引き継ぎ値をプレースホルダーに
+                          const resolved = resolveCustomAmount(HD.monthlyAmounts);
+                          const placeholder = i===0?"0":String(resolved[MONTHS[i-1]]||0);
+                          return (
+                            <div key={m}>
+                              <div style={{fontSize:10,color:CS.sub,marginBottom:3,fontWeight:600}}>{m}</div>
+                              <div style={{display:"flex",alignItems:"center",gap:3}}>
+                                <input
+                                  type="number"
+                                  value={val??""}
+                                  placeholder={placeholder}
+                                  onChange={e=>{
+                                    const v = e.target.value;
+                                    patchHD("monthlyAmounts",{...(HD.monthlyAmounts||{}),
+                                      [m]: v===""?undefined:Number(v)});
+                                  }}
+                                  style={{width:"100%",padding:"5px 7px",border:`1px solid ${val!==undefined?CS.blue:CS.border}`,
+                                    borderRadius:6,fontSize:12,
+                                    background:val!==undefined?"#eff6ff":"#fff",
+                                    color:val!==undefined?CS.blue:CS.text,outline:"none"}}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div style={{marginTop:8,fontSize:11,color:CS.mute}}>
+                        年間合計：<b style={{color:CS.text}}>{fmtY(MONTHS.reduce((s,m)=>s+resolveCustomAmount(HD.monthlyAmounts)[m],0))}</b>
+                        　増加は正の数、削減は負の数
+                      </div>
+                    </MField>
+                  ) : (
+                    <MField label="適用月（複数選択可）">
+                      <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                        {MONTHS.map(m=>{
+                          const on=(HD.specificMonths||[]).includes(m);
+                          return (
+                            <button key={m} onClick={()=>{
+                              const cur=HD.specificMonths||[];
+                              patchHD("specificMonths",on?cur.filter(x=>x!==m):[...cur,m]);
+                            }} style={{padding:"5px 10px",borderRadius:6,cursor:"pointer",fontSize:11,fontWeight:700,
+                              border:`2px solid ${on?CS.blue:CS.border}`,
+                              background:on?"#eff6ff":"#fff",color:on?CS.blue:CS.sub}}>
+                              {m}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </MField>
+                  )}
+                  <MField label="メモ" hint="任意">
+                    <input value={HD.note} onChange={e=>patchHD("note",e.target.value)}
+                      style={{...iStyle,width:"100%"}} placeholder="例：4月から新オフィスに移転"/>
+                  </MField>
+                  {/* プレビュー */}
+                  <div style={{background:"#f0f9ff",border:"1px solid #bae6fd",borderRadius:8,padding:"10px 14px"}}>
+                    <div style={{fontSize:11,color:"#0369a1",fontWeight:700,marginBottom:6}}>年間影響試算</div>
+                    {(() => {
+                      const months = HD.applyType==="monthly"
+                        ? MONTHS.filter(m=>{const si=MONTH_IDX[HD.startMonth??"4月"],ei=MONTH_IDX[HD.endMonth??"3月"],mi=MONTH_IDX[m];return si<=ei?mi>=si&&mi<=ei:mi>=si||mi<=ei;})
+                        : (HD.specificMonths||[]);
+                      const effect = months.length*(HD.amount||0);
+                      return (
+                        <div style={{fontSize:13,color:CS.text}}>
+                          適用月数: <b>{months.length}ヶ月</b>　年間影響: <b style={{color:effect>=0?"#dc2626":"#059669"}}>{effect>=0?"+":""}{fmtM(effect)}</b>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:10,marginTop:20}}>
+                  <button onClick={saveHD}
+                    style={{flex:1,background:CS.blue,color:"#fff",border:"none",padding:"11px",
+                      borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:700}}>
+                    {hankanhiModal.mode==="add"?"追加する":"保存する"}
+                  </button>
+                  <button onClick={()=>setHankanhiModal(null)}
+                    style={{flex:1,background:"transparent",color:CS.sub,border:`1px solid ${CS.border}`,
+                      padding:"11px",borderRadius:9,cursor:"pointer",fontSize:13}}>キャンセル</button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* ══ 期別推移 ══ */}
+        {tab==="history" && (() => {
+          const hasmulti = Object.keys(historyData).length > 0;
+          const maxTotal = Math.max(...Object.values(historyData).map(d=>d?.total||0),1);
+          return (
+          <div style={{display:"flex",flexDirection:"column",gap:20}}>
+
+            {/* 期別推移テーブル */}
+            <div style={card()}>
+              <STitle>期別経費推移</STitle>
+              {!hasmulti ? (
+                <div style={{textAlign:"center",padding:"40px 0",color:CS.mute,fontSize:13}}>
+                  <div style={{fontSize:32,marginBottom:12}}>📉</div>
+                  <div>複数の期を登録すると推移グラフが表示されます。</div>
+                  <div style={{marginTop:8,fontSize:11}}>「＋ 新しい期」から次期を追加してください。</div>
+                </div>
+              ) : (
+                <div style={{overflowX:"auto"}}>
+                  <table style={{borderCollapse:"collapse",fontSize:12,width:"100%",minWidth:700}}>
+                    <thead>
+                      <tr>
+                        {["期","年度","人件費","前期比","販管費","前期比","経費合計","前期比"].map((h,i)=>(
+                          <th key={i} style={{padding:"9px 12px",textAlign:i<=1?"left":"right",
+                            borderBottom:`2px solid ${CS.border}`,fontSize:11,color:CS.sub,
+                            fontWeight:700,background:"#f8fafc",whiteSpace:"nowrap"}}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...periods].reverse().map((p,i,arr)=>{ const origI=periods.length-1-i;
+                        const cur  = historyData[p.id];
+                        const prev = origI>0 ? historyData[periods[origI-1].id] : null;
+                        const isCurrent = p.id===currentPid;
+                        const diff = (key) => cur&&prev ? (cur[key]||0)-(prev[key]||0) : null;
+                        const fmtDiff2 = (d) => d===null?"—":d===0?"±0":(d>0?"+":"")+fmtM(d);
+                        const diffColor = (d) => d===null?"#94a3b8":d>0?"#dc2626":d<0?"#059669":"#64748b";
+                        return (<>
+                          <tr key={p.id} style={{background:isCurrent?"#eff6ff":"#fff",
+                            borderBottom:`1px solid ${CS.border}`}}>
+                            <td style={{padding:"12px 12px",fontWeight:700,color:isCurrent?CS.blue:CS.text,whiteSpace:"nowrap"}}>
+                              {p.label}{isCurrent&&<span style={{fontSize:9,color:CS.blue,marginLeft:4}}>▶現在</span>}
+                            </td>
+                            <td style={{padding:"12px 12px",color:CS.sub}}>{p.year}</td>
+                            <td style={{padding:"12px 12px",textAlign:"right",fontWeight:700,color:CS.blue}}>
+                              {cur?.jinkenhi?fmtM(cur.jinkenhi):"—"}
+                            </td>
+                            <td style={{padding:"12px 12px",textAlign:"right",fontSize:11,color:diffColor(diff("jinkenhi"))}}>
+                              {fmtDiff2(diff("jinkenhi"))}
+                            </td>
+                            <td style={{padding:"12px 12px",textAlign:"right",fontWeight:700,color:CS.purple}}>
+                              {cur?.hankanhi?fmtM(cur.hankanhi):"—"}
+                            </td>
+                            <td style={{padding:"12px 12px",textAlign:"right",fontSize:11,color:diffColor(diff("hankanhi"))}}>
+                              {fmtDiff2(diff("hankanhi"))}
+                            </td>
+                            <td style={{padding:"12px 12px",textAlign:"right",fontWeight:700,color:CS.text}}>
+                              {cur?.total?fmtM(cur.total):"—"}
+                            </td>
+                            <td style={{padding:"12px 12px",textAlign:"right",fontSize:11,color:diffColor(diff("total"))}}>
+                              {fmtDiff2(diff("total"))}
+                            </td>
+                          </tr>
+                          {/* ベア後行（現在期のみ） */}
+                          {isCurrent && showBear && (
+                            <tr key={`${p.id}-bear`} style={{background:"#fffbeb",borderBottom:`2px solid #f59e0b`}}>
+                              <td style={{padding:"8px 12px",fontWeight:700,color:"#92400e",whiteSpace:"nowrap",fontSize:11}}>
+                                └ ベア後
+                              </td>
+                              <td style={{padding:"8px 12px",fontSize:10,color:"#92400e"}}>試算</td>
+                              <td style={{padding:"8px 12px",textAlign:"right",fontWeight:700,color:"#f59e0b"}}>
+                                {fmtM(bear_jinkenhi_annual)}
+                                <div style={{fontSize:9,color:"#b45309"}}>+{fmtM(bearDiff)}</div>
+                              </td>
+                              <td style={{padding:"8px 12px",textAlign:"right",fontSize:10,color:"#b45309"}}>
+                                {cur?.jinkenhi?fmtDiff2(bear_jinkenhi_annual-(historyData[periods[origI>0?origI-1:0].id]?.jinkenhi||0)):"—"}
+                              </td>
+                              <td style={{padding:"8px 12px",textAlign:"right",fontWeight:700,color:CS.purple}}>
+                                {fmtM(hankanhi_annual)}
+                              </td>
+                              <td style={{padding:"8px 12px",textAlign:"right",fontSize:10,color:"#b45309"}}>
+                                {prev?fmtDiff2(hankanhi_annual-(prev.hankanhi||0)):"—"}
+                              </td>
+                              <td style={{padding:"8px 12px",textAlign:"right",fontWeight:700,color:"#f59e0b"}}>
+                                {fmtM(bear_sougou_annual)}
+                                <div style={{fontSize:9,color:"#b45309"}}>+{fmtM(bear_sougou_annual-sougou_annual)}</div>
+                              </td>
+                              <td style={{padding:"8px 12px",textAlign:"right",fontSize:10,color:"#b45309"}}>
+                                {prev?fmtDiff2(bear_sougou_annual-(prev.total||0)):"—"}
+                              </td>
+                            </tr>
+                          )}
+                        </>);
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* バーチャート */}
+            {hasmulti && (
+              <div style={card()}>
+                <STitle>経費推移グラフ</STitle>
+                <div style={{display:"flex",gap:12,fontSize:10,color:CS.sub,marginBottom:16}}>
+                  <span><span style={{display:"inline-block",width:10,height:10,background:CS.blue,borderRadius:2,marginRight:4}}/>人件費</span>
+                  <span><span style={{display:"inline-block",width:10,height:10,background:CS.purple,borderRadius:2,marginRight:4}}/>販管費</span>
+                </div>
+                {[...periods].reverse().map(p=>{
+                  const d=historyData[p.id];
+                  if(!d) return null;
+                  const isCurrent=p.id===currentPid;
+                  const jinPct = d.jinkenhi/maxTotal*100;
+                  const hanPct = d.hankanhi/maxTotal*100;
+                  return (
+                    <div key={p.id} style={{display:"flex",alignItems:"center",gap:12,marginBottom:14}}>
+                      <div style={{width:70,fontSize:11,color:isCurrent?CS.blue:CS.sub,fontWeight:isCurrent?700:400,
+                        textAlign:"right",flexShrink:0}}>{p.label}</div>
+                      <div style={{flex:1,display:"flex",flexDirection:"column",gap:3}}>
+                        <div style={{display:"flex",height:16,borderRadius:4,overflow:"hidden",background:"#f1f5f9"}}>
+                          <div style={{width:`${jinPct}%`,background:CS.blue,transition:"width .4s"}}/>
+                          <div style={{width:`${hanPct}%`,background:CS.purple,transition:"width .4s"}}/>
+                        </div>
+                        <div style={{fontSize:10,color:CS.mute}}>
+                          人件費 {fmtM(d.jinkenhi)} / 販管費 {fmtM(d.hankanhi)} / 合計 {fmtM(d.total)}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* 期別データ管理 */}
+            <div style={card()}>
+              <STitle>期別データ管理</STitle>
+              <div style={{display:"flex",flexWrap:"wrap",gap:12}}>
+                {[...periods].map(p=>(
+                  <div key={p.id} onClick={()=>switchPeriod(p.id)} style={{
+                    padding:"14px 20px",borderRadius:10,cursor:"pointer",
+                    border:`2px solid ${p.id===currentPid?CS.blue:CS.border}`,
+                    background:p.id===currentPid?"#eff6ff":"#fff",minWidth:160,transition:"all .15s"
+                  }}>
+                    <div style={{fontSize:13,fontWeight:700,color:p.id===currentPid?CS.blue:CS.text}}>{p.label}</div>
+                    <div style={{fontSize:11,color:CS.sub,marginTop:2}}>{p.year}</div>
+                    {historyData[p.id]&&<>
+                      <div style={{fontSize:11,color:CS.blue,marginTop:4}}>人件費 {fmtM(historyData[p.id].jinkenhi)}</div>
+                      <div style={{fontSize:11,color:CS.purple}}>販管費 {fmtM(historyData[p.id].hankanhi)}</div>
+                      <div style={{fontSize:11,fontWeight:700,color:CS.text}}>合計 {fmtM(historyData[p.id].total)}</div>
+                    </>}
+                    {p.id===currentPid&&<div style={{fontSize:10,color:CS.blue,marginTop:4,fontWeight:700}}>▶ 選択中</div>}
+                  </div>
+                ))}
+                <div onClick={()=>setPeriodModal(true)} style={{
+                  padding:"14px 20px",borderRadius:10,cursor:"pointer",
+                  border:`2px dashed ${CS.border}`,background:"#f8fafc",
+                  minWidth:160,display:"flex",alignItems:"center",justifyContent:"center",
+                  color:CS.mute,fontSize:13,fontWeight:600
+                }}>＋ 新しい期を追加</div>
+              </div>
+            </div>
+          </div>
+          );
+        })()}
+
+        {/* ══ 期追加モーダル ══ */}
+        {periodModal && (() => {
+          const nextId = Math.max(...periods.map(p=>p.id)) + 1;
+          const nextYear = Math.max(...periods.map(p=>p.startYear)) + 1;
+          const [newPeriod, setNewPeriod] = React.useState({
+            id: nextId,
+            label: `第${nextId}期`,
+            year: `${nextYear+1}年度`,
+            startYear: nextYear,
+          });
+          return (
+            <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.5)",zIndex:3000,display:"flex",alignItems:"center",justifyContent:"center"}}>
+              <div style={{background:"#fff",borderRadius:14,padding:28,width:360,boxShadow:"0 8px 40px rgba(0,0,0,.2)"}}>
+                <div style={{fontSize:16,fontWeight:700,marginBottom:20}}>📅 新しい期を追加</div>
+                <div style={{display:"flex",flexDirection:"column",gap:14}}>
+                  <div>
+                    <div style={{fontSize:11,color:CS.sub,marginBottom:4}}>期の名称</div>
+                    <input value={newPeriod.label} onChange={e=>setNewPeriod(p=>({...p,label:e.target.value}))}
+                      style={{width:"100%",padding:"8px 12px",border:`1px solid ${CS.border}`,borderRadius:8,fontSize:13}} />
+                  </div>
+                  <div>
+                    <div style={{fontSize:11,color:CS.sub,marginBottom:4}}>年度</div>
+                    <input value={newPeriod.year} onChange={e=>setNewPeriod(p=>({...p,year:e.target.value}))}
+                      style={{width:"100%",padding:"8px 12px",border:`1px solid ${CS.border}`,borderRadius:8,fontSize:13}} />
+                  </div>
+                  <div style={{fontSize:11,color:CS.mute,background:"#f0f9ff",border:"1px solid #bae6fd",borderRadius:8,padding:"8px 12px"}}>
+                    ✅ 前期のスタッフ情報を引き継ぎます（年齢+1歳、手動上書き値はリセット）
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:10,marginTop:20}}>
+                  <button onClick={()=>{addPeriod(newPeriod);setPeriodModal(false);}}
+                    style={{flex:1,background:CS.blue,color:"#fff",border:"none",padding:"11px",borderRadius:9,cursor:"pointer",fontSize:13,fontWeight:700}}>
+                    追加する
+                  </button>
+                  <button onClick={()=>setPeriodModal(false)}
+                    style={{flex:1,background:"transparent",color:CS.sub,border:`1px solid ${CS.border}`,padding:"11px",borderRadius:9,cursor:"pointer",fontSize:13}}>
+                    キャンセル
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* ══ 税理士確認 ══ */}
+        {tab==="tax" && (()=>{
+          // 項目定義
+          const cols = [
+            { key:"base",    label:"基本給",         fn:(s,m)=>isWorking(s,m) ? (()=>{
+                const g = calcMonthlyGross(s,m);
+                const ot = s.overtimeAmountOverride!=null&&s.overtimeAmountOverride!==""
+                  ? Number(s.overtimeAmountOverride)
+                  : calcOvertimeDetail(s.monthlyBase, calcMonthlyOTHours(s.overtimeRate)).total;
+                const allowance = (s.posAllowanceIdx>0?(POSITION_ALLOWANCES[s.posAllowanceIdx]?.amount||0):0)
+                  + (s.commAllowance||0) + (s.housingAllowance||0);
+                return g - ot - allowance;
+              })() : 0,
+              color:"#1e40af" },
+            { key:"allowance", label:"手当",          fn:(s,m)=>isWorking(s,m) ? (
+                (s.posAllowanceIdx>0?(POSITION_ALLOWANCES[s.posAllowanceIdx]?.amount||0):0)
+                + (s.commAllowance||0) + (s.housingAllowance||0)
+                + (s.overtimeAmountOverride!=null&&s.overtimeAmountOverride!==""
+                  ? Number(s.overtimeAmountOverride)
+                  : calcOvertimeDetail(s.monthlyBase, calcMonthlyOTHours(s.overtimeRate)).total)
+              ) : 0,
+              color:"#0369a1" },
+            { key:"ins",     label:"社保（月次）",    fn:(s,m)=>calcInsMonth(s,m),   color:"#059669" },
+            { key:"bonus9",  label:"賞与（9月）",     fn:(s,m)=>m==="9月"?calcBonus(s,m):0,  color:"#7c3aed" },
+            { key:"bIns9",   label:"社保（賞与9月）", fn:(s,m)=>m==="9月"?calcBonusInsMonth(s,m):0, color:"#059669" },
+            { key:"bonus3",  label:"賞与（3月）",     fn:(s,m)=>m==="3月"?calcBonus(s,m):0,  color:"#7c3aed" },
+            { key:"bIns3",   label:"社保（賞与3月）", fn:(s,m)=>m==="3月"?calcBonusInsMonth(s,m):0, color:"#059669" },
+            { key:"itax",    label:"所得税",          fn:(s,m)=>isWorking(s,m)?(s.incomeTaxOverride||0):0,   color:"#b45309" },
+            { key:"rtax",    label:"住民税",          fn:(s,m)=>isWorking(s,m)?(s.residentTaxOverride||0):0, color:"#b45309" },
+          ];
+
+          const annual = (s, colFn) => MONTHS.reduce((a,m)=>a+colFn(s,m), 0);
+          const grandTotal = (colFn) => activeStaff.reduce((a,s)=>a+annual(s,colFn), 0);
+
+          return (
+            <div style={{display:"flex",flexDirection:"column",gap:16}}>
+              <div style={{...card()}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+                  <STitle style={{margin:0}}>🧾 税理士確認用 年間明細（第{currentPid}期）</STitle>
+                  <button onClick={()=>{
+                    const header = ["氏名","雇用形態",...cols.map(c=>c.label)];
+                    const rows = activeStaff.map(s=>[
+                      s.name,
+                      ET[s.empType]?.label,
+                      ...cols.map(c=>annual(s,c.fn)),
+                    ]);
+                    const footer = ["合計","—",...cols.map(c=>grandTotal(c.fn))];
+                    const csv = [header,...rows,footer].map(r=>r.join(",")).join("\n");
+                    setCsvModal(csv);
+                  }} style={{fontSize:11,fontWeight:700,padding:"5px 14px",borderRadius:6,
+                    background:"#1e293b",color:"#fff",border:"none",cursor:"pointer"}}>
+                    📋 CSV表示
+                  </button>
+                </div>
+                <div style={{overflowX:"auto"}}>
+                  <table style={{borderCollapse:"collapse",fontSize:11,minWidth:900,width:"100%"}}>
+                    <thead>
+                      <tr style={{background:"#f8fafc"}}>
+                        <th style={{...thS({w:88,sticky:true,bg:"#f8fafc"}),textAlign:"left"}}>氏名</th>
+                        <th style={thS({w:64,bg:"#f8fafc"})}>種別</th>
+                        {cols.map(c=>(
+                          <th key={c.key} style={{padding:"8px 10px",textAlign:"right",fontSize:10,
+                            fontWeight:700,color:c.color,borderBottom:`2px solid #e2e8f0`,
+                            whiteSpace:"nowrap",background:"#f8fafc"}}>
+                            {c.label}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {activeStaff.map((s,i)=>{
+                        const rowBg = i%2===0?"#fff":"#f8fafc";
+                        const col = ET[s.empType]?.color;
+                        return (
+                          <tr key={s.id} style={{background:rowBg,borderBottom:"1px solid #f1f5f9"}}>
+                            <td style={{...tdS(),fontWeight:700,position:"sticky",left:0,
+                              background:rowBg,borderLeft:`3px solid ${col}`,paddingLeft:12}}>
+                              {s.name}
+                            </td>
+                            <td style={tdS()}><GradeChip g={gradeByKey[s.gradeKey]} small/></td>
+                            {cols.map(c=>{
+                              const v = annual(s,c.fn);
+                              return (
+                                <td key={c.key} style={{...tdS(),textAlign:"right",
+                                  color:v===0?CS.mute:c.color,fontWeight:v>0?500:400}}>
+                                  {v===0?"—":fmtM(v)}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                    <tfoot>
+                      <tr style={{background:"#1e293b"}}>
+                        <td style={{...tdS(),fontWeight:700,color:"#fff",position:"sticky",left:0,background:"#1e293b",paddingLeft:12}}>合計</td>
+                        <td style={{...tdS(),color:"#94a3b8"}}>—</td>
+                        {cols.map(c=>(
+                          <td key={c.key} style={{...tdS(),textAlign:"right",fontWeight:700,color:"#60a5fa"}}>
+                            {fmtM(grandTotal(c.fn))}
+                          </td>
+                        ))}
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+                <div style={{marginTop:10,fontSize:10,color:CS.mute,lineHeight:1.8}}>
+                  ※ 基本給＝月次総支給から手当・残業代を除いた額　※ 手当＝役職手当・交通費・住宅手当・残業代の合計<br/>
+                  ※ 所得税・住民税は手動上書き値を月数分合算　※ 賞与は9月・3月を個別表示
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+      <style>{`*{box-sizing:border-box;}::-webkit-scrollbar{width:6px;height:6px;}::-webkit-scrollbar-track{background:#f1f5f9;}::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px;}input[type=number]::-webkit-inner-spin-button{opacity:.4;}button:hover{opacity:.88;}`}</style>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
