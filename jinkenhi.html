@@ -803,11 +803,18 @@ function App() {
       gradeMasterByPeriod,
     };
     const json = JSON.stringify(payload, null, 2);
+    // JSONファイルとしてダウンロード
     try {
-      await navigator.clipboard.writeText(json);
-      showNotif("✅ バックアップをクリップボードにコピーしました。メモ帳等に貼り付けて保存してください。");
+      const blob = new Blob([json], {type: "application/json"});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const date = new Date().toISOString().slice(0,10).replace(/-/g,"");
+      a.href = url;
+      a.download = `jinkenhi_backup_${date}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showNotif("✅ バックアップファイルをダウンロードしました");
     } catch(e) {
-      // フォールバック：textareaで選択させる
       setBackupText(json);
     }
   };
@@ -1003,11 +1010,13 @@ function App() {
                 padding:"7px 14px",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
               ⬇️ バックアップ
             </button>
-            <button onClick={()=>setRestoreText("")}
+            <label
               style={{background:"rgba(255,255,255,.1)",color:"#94a3b8",border:"1px solid rgba(255,255,255,.2)",
-                borderRadius:8,padding:"7px 14px",fontSize:11,fontWeight:700,cursor:"pointer",textAlign:"center",whiteSpace:"nowrap"}}>
-              ⬆️ 復元
-            </button>
+                borderRadius:8,padding:"7px 14px",fontSize:11,fontWeight:700,cursor:"pointer",textAlign:"center",whiteSpace:"nowrap",display:"inline-block"}}>
+              ⬆️ 復元（ファイル）
+              <input type="file" accept=".json" onChange={importData} style={{display:"none"}}/>
+            </label>
+
           </div>
         </div>
       </div>
@@ -2231,40 +2240,7 @@ function App() {
         </div>
       )}
 
-      {/* ══ 復元テキスト貼り付けモーダル ══ */}
-      {restoreText !== null && (
-        <div style={{position:"fixed",inset:0,background:"rgba(15,23,42,.6)",display:"flex",
-          alignItems:"center",justifyContent:"center",zIndex:5000,padding:16}}>
-          <div style={{background:CS.surface,border:`1px solid ${CS.border}`,borderRadius:16,
-            padding:24,width:"100%",maxWidth:600,boxShadow:"0 20px 60px rgba(0,0,0,.3)"}}>
-            <h3 style={{margin:"0 0 8px",fontSize:15,fontWeight:700}}>⬆️ データ復元</h3>
-            <p style={{fontSize:11,color:CS.mute,margin:"0 0 12px"}}>
-              バックアップ時にコピーしたJSONテキストをそのまま貼り付けてください。
-            </p>
-            <textarea
-              value={restoreText}
-              onChange={e=>setRestoreText(e.target.value)}
-              placeholder='{"version":1,"exportedAt":...  のテキストを貼り付け'
-              style={{width:"100%",height:200,fontSize:10,fontFamily:"monospace",
-                padding:10,borderRadius:8,border:`1px solid ${CS.border}`,
-                background:"#f8fafc",resize:"none",boxSizing:"border-box"}}
-            />
-            <div style={{display:"flex",gap:10,marginTop:12}}>
-              <button onClick={()=>importFromText(restoreText)}
-                disabled={!restoreText.trim()}
-                style={{flex:1,background:restoreText.trim()?CS.blue:"#94a3b8",color:"#fff",
-                  border:"none",borderRadius:8,padding:"10px",fontSize:13,fontWeight:700,
-                  cursor:restoreText.trim()?"pointer":"not-allowed"}}>
-                復元する
-              </button>
-              <button onClick={()=>setRestoreText(null)}
-                style={{flex:1,background:"transparent",color:CS.sub,
-                  border:`1px solid ${CS.border}`,borderRadius:8,padding:"10px",
-                  fontSize:13,cursor:"pointer"}}>キャンセル</button>
-            </div>
-          </div>
-        </div>
-      )}
+
 
       {/* ══ 削除確認ダイアログ ══ */}
         {confirmDel && (
