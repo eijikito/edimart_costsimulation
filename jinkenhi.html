@@ -1962,7 +1962,7 @@ function App() {
                   })()}
                 </div>}
               </div>
-              <MGrid2><MField label="社会保険（月・手動）※加入時のみ入力・空欄で0円"><MInputN val={D.insOverride??""} set={v=>patchModal("insOverride",v===""||v===0?null:v)}/></MField></MGrid2></>
+              <MGrid2><MField label="社会保険（月・手動）※空欄で自動計算・非加入なら0を入力"><MInputN val={D.insOverride??""} set={v=>patchModal("insOverride",v===""||v===0?null:v)}/></MField></MGrid2></>
             ):(
               <><div style={{background:"#f0f9ff",border:"1px solid #bae6fd",borderRadius:8,padding:"8px 14px",fontSize:11,color:"#0369a1",marginBottom:10}}>
                 <div style={{marginBottom:3}}>自動試算（愛知県協会けんぽ2026年度）</div>
