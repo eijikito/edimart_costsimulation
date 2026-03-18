@@ -1039,7 +1039,7 @@ function App() {
           {k:"monthly",   label:"📅 月次人件費一覧"},
           {k:"bear",      label:"📈 ベアシミュレーション"},
           {k:"grademap",  label:"🗺 キャリアマップ"},
-          {k:"tax",       label:"🧾 税理士確認"},
+
           {k:"hankanhi",  label:"💰 販管費"},
           {k:"sougou",    label:"📋 経費合計（人件費＋販管費）"},
           {k:"history",   label:"📉 期別推移"},
@@ -1437,8 +1437,29 @@ function App() {
               },
             ].map(({title,color,bg,borderCol,fn,annualFn})=>(
               <div key={title} style={{...card(),padding:0,overflow:"hidden"}}>
-                <div style={{padding:"10px 16px",background:bg,borderBottom:`1px solid ${borderCol}`,fontWeight:700,fontSize:13,color}}>
-                  {title}
+                <div style={{padding:"10px 16px",background:bg,borderBottom:`1px solid ${borderCol}`,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                  <span style={{fontWeight:700,fontSize:13,color}}>{title}</span>
+                  <button onClick={()=>{
+                    const header = ["氏名","種別",...MONTHS,"年間合計"];
+                    const rows = activeStaff.map(s=>[
+                      s.name,
+                      EMP_TYPES[s.empType]?.label??s.empType,
+                      ...MONTHS.map(m=>fn(s,m)),
+                      annualFn(s),
+                    ]);
+                    const footer = ["合計","—",...MONTHS.map(m=>activeStaff.reduce((a,s)=>a+fn(s,m),0)),activeStaff.reduce((a,s)=>a+annualFn(s),0)];
+                    const csv = [header,...rows,footer].map(r=>r.join(",")).join("\n");
+                    const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"});
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `${title.replace(/[💴🏥📊 （）()]/g,"")}_第${currentPid}期.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }} style={{fontSize:11,fontWeight:700,padding:"4px 12px",borderRadius:6,
+                    background:"#1e293b",color:"#fff",border:"none",cursor:"pointer",whiteSpace:"nowrap"}}>
+                    📋 CSV
+                  </button>
                 </div>
                 <div style={{overflowX:"auto"}}>
                   <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,minWidth:900}}>
@@ -3057,121 +3078,6 @@ function App() {
                     style={{flex:1,background:"transparent",color:CS.sub,border:`1px solid ${CS.border}`,padding:"11px",borderRadius:9,cursor:"pointer",fontSize:13}}>
                     キャンセル
                   </button>
-                </div>
-              </div>
-            </div>
-          );
-        })()}
-
-        {/* ══ 税理士確認 ══ */}
-        {tab==="tax" && (()=>{
-          // 項目定義
-          const cols = [
-            { key:"base",    label:"基本給",         fn:(s,m)=>isWorking(s,m) ? (()=>{
-                const g = calcMonthlyGross(s,m);
-                const ot = s.overtimeAmountOverride!=null&&s.overtimeAmountOverride!==""
-                  ? Number(s.overtimeAmountOverride)
-                  : calcOvertimeDetail(s.monthlyBase, calcMonthlyOTHours(s.overtimeRate)).total;
-                const allowance = (s.posAllowanceIdx>0?(POSITION_ALLOWANCES[s.posAllowanceIdx]?.amount||0):0)
-                  + (s.commAllowance||0) + (s.housingAllowance||0);
-                return g - ot - allowance;
-              })() : 0,
-              color:"#1e40af" },
-            { key:"allowance", label:"手当",          fn:(s,m)=>isWorking(s,m) ? (
-                (s.posAllowanceIdx>0?(POSITION_ALLOWANCES[s.posAllowanceIdx]?.amount||0):0)
-                + (s.commAllowance||0) + (s.housingAllowance||0)
-                + (s.overtimeAmountOverride!=null&&s.overtimeAmountOverride!==""
-                  ? Number(s.overtimeAmountOverride)
-                  : calcOvertimeDetail(s.monthlyBase, calcMonthlyOTHours(s.overtimeRate)).total)
-              ) : 0,
-              color:"#0369a1" },
-            { key:"ins",     label:"社保（月次）",    fn:(s,m)=>calcInsMonth(s,m),   color:"#059669" },
-            { key:"bonus9",  label:"賞与（9月）",     fn:(s,m)=>m==="9月"?calcBonus(s,m):0,  color:"#7c3aed" },
-            { key:"bIns9",   label:"社保（賞与9月）", fn:(s,m)=>m==="9月"?calcBonusInsMonth(s,m):0, color:"#059669" },
-            { key:"bonus3",  label:"賞与（3月）",     fn:(s,m)=>m==="3月"?calcBonus(s,m):0,  color:"#7c3aed" },
-            { key:"bIns3",   label:"社保（賞与3月）", fn:(s,m)=>m==="3月"?calcBonusInsMonth(s,m):0, color:"#059669" },
-            { key:"itax",    label:"所得税",          fn:(s,m)=>isWorking(s,m)?(s.incomeTaxOverride||0):0,   color:"#b45309" },
-            { key:"rtax",    label:"住民税",          fn:(s,m)=>isWorking(s,m)?(s.residentTaxOverride||0):0, color:"#b45309" },
-          ];
-
-          const annual = (s, colFn) => MONTHS.reduce((a,m)=>a+colFn(s,m), 0);
-          const grandTotal = (colFn) => activeStaff.reduce((a,s)=>a+annual(s,colFn), 0);
-
-          return (
-            <div style={{display:"flex",flexDirection:"column",gap:16}}>
-              <div style={{...card()}}>
-                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
-                  <STitle style={{margin:0}}>🧾 税理士確認用 年間明細（第{currentPid}期）</STitle>
-                  <button onClick={()=>{
-                    const header = ["氏名","雇用形態",...cols.map(c=>c.label)];
-                    const rows = activeStaff.map(s=>[
-                      s.name,
-                      ET[s.empType]?.label,
-                      ...cols.map(c=>annual(s,c.fn)),
-                    ]);
-                    const footer = ["合計","—",...cols.map(c=>grandTotal(c.fn))];
-                    const csv = [header,...rows,footer].map(r=>r.join(",")).join("\n");
-                    setCsvModal(csv);
-                  }} style={{fontSize:11,fontWeight:700,padding:"5px 14px",borderRadius:6,
-                    background:"#1e293b",color:"#fff",border:"none",cursor:"pointer"}}>
-                    📋 CSV表示
-                  </button>
-                </div>
-                <div style={{overflowX:"auto"}}>
-                  <table style={{borderCollapse:"collapse",fontSize:11,minWidth:900,width:"100%"}}>
-                    <thead>
-                      <tr style={{background:"#f8fafc"}}>
-                        <th style={{...thS({w:88,sticky:true,bg:"#f8fafc"}),textAlign:"left"}}>氏名</th>
-                        <th style={thS({w:64,bg:"#f8fafc"})}>種別</th>
-                        {cols.map(c=>(
-                          <th key={c.key} style={{padding:"8px 10px",textAlign:"right",fontSize:10,
-                            fontWeight:700,color:c.color,borderBottom:`2px solid #e2e8f0`,
-                            whiteSpace:"nowrap",background:"#f8fafc"}}>
-                            {c.label}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {activeStaff.map((s,i)=>{
-                        const rowBg = i%2===0?"#fff":"#f8fafc";
-                        const col = ET[s.empType]?.color;
-                        return (
-                          <tr key={s.id} style={{background:rowBg,borderBottom:"1px solid #f1f5f9"}}>
-                            <td style={{...tdS(),fontWeight:700,position:"sticky",left:0,
-                              background:rowBg,borderLeft:`3px solid ${col}`,paddingLeft:12}}>
-                              {s.name}
-                            </td>
-                            <td style={tdS()}><GradeChip g={gradeByKey[s.gradeKey]} small/></td>
-                            {cols.map(c=>{
-                              const v = annual(s,c.fn);
-                              return (
-                                <td key={c.key} style={{...tdS(),textAlign:"right",
-                                  color:v===0?CS.mute:c.color,fontWeight:v>0?500:400}}>
-                                  {v===0?"—":fmtM(v)}
-                                </td>
-                              );
-                            })}
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                    <tfoot>
-                      <tr style={{background:"#1e293b"}}>
-                        <td style={{...tdS(),fontWeight:700,color:"#fff",position:"sticky",left:0,background:"#1e293b",paddingLeft:12}}>合計</td>
-                        <td style={{...tdS(),color:"#94a3b8"}}>—</td>
-                        {cols.map(c=>(
-                          <td key={c.key} style={{...tdS(),textAlign:"right",fontWeight:700,color:"#60a5fa"}}>
-                            {fmtM(grandTotal(c.fn))}
-                          </td>
-                        ))}
-                      </tr>
-                    </tfoot>
-                  </table>
-                </div>
-                <div style={{marginTop:10,fontSize:10,color:CS.mute,lineHeight:1.8}}>
-                  ※ 基本給＝月次総支給から手当・残業代を除いた額　※ 手当＝役職手当・交通費・住宅手当・残業代の合計<br/>
-                  ※ 所得税・住民税は手動上書き値を月数分合算　※ 賞与は9月・3月を個別表示
                 </div>
               </div>
             </div>
