@@ -245,7 +245,17 @@ const calcInsMonth = (s,month) => {
   if (!isWorking(s,month)) return 0;
   const kaigo    = (s.age>=40 && s.age<=64) ? KAIGO_RATE_COMP : 0;
   const kosodate = KOSODATE_MONTHS.includes(month) ? KOSODATE_RATE : 0; // 子育て支援金は5月〜・会社負担のみ
-  if (s.empType==="PART") return (s.insOverride??0) + (s.insOverride!=null ? Math.round((s.insOverride/(INS_RATE.health+INS_RATE.pension+INS_RATE.employ+kaigo))*kosodate) : 0);
+  if (s.empType==="PART") {
+    const gross = calcMonthlyGross(s, month);
+    const hyojun = getHyojun(gross);
+    if (s.insOverride!==null && s.insOverride!==undefined) {
+      // 手動上書き値＋子育て支援金
+      return s.insOverride + Math.round(hyojun * kosodate);
+    }
+    // 自動計算：正社員と同じ標準報酬月額テーブル
+    if (gross <= 0) return 0;
+    return Math.round(hyojun * (INS_RATE.health + INS_RATE.pension + INS_RATE.employ + kaigo + kosodate));
+  }
   if (s.insOverride!==null && s.insOverride!==undefined) {
     // 手動上書き時：上書き値＋子育て支援金（標準報酬月額から逆算）
     const hyojun = getHyojun(s.empType==="EXEC" ? s.monthlyBase : calcMonthlyGross(s,month));
